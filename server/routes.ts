@@ -372,7 +372,8 @@ saasRouter.post('/whatsapp/connect/byo', authenticateToken, requireTenant, async
       accessToken,
       wabaId,
       phoneNumberId,
-      coexistenceEnabled: Boolean(coexistenceEnabled)
+      coexistenceEnabled: Boolean(coexistenceEnabled),
+      req
     });
 
     res.json(result);
@@ -399,7 +400,8 @@ saasRouter.post('/whatsapp/connect/embedded-signup', authenticateToken, requireT
       code,
       wabaId,
       phoneNumberId,
-      coexistenceEnabled: Boolean(coexistenceEnabled)
+      coexistenceEnabled: Boolean(coexistenceEnabled),
+      req
     });
 
     res.json(result);

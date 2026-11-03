@@ -400,6 +400,8 @@ export async function initDatabase() {
       { table: 'tenants', col: 'billing_contact_name', type: 'TEXT' },
       { table: 'tenants', col: 'billing_contact_phone', type: 'TEXT' },
       { table: 'tenants', col: 'billing_contact_email', type: 'TEXT' },
+      { table: 'whatsapp_channels', col: 'webhook_verified_at', type: 'BIGINT' },
+      { table: 'whatsapp_channels', col: 'webhook_url', type: 'TEXT' },
       { table: 'conversations', col: 'assigned_to_user_id', type: 'TEXT' },
       { table: 'conversations', col: 'internal_notes', type: 'TEXT' },
       { table: 'conversations', col: 'tags', type: 'TEXT' },

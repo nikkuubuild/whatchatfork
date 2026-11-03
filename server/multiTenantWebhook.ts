@@ -100,7 +100,7 @@ export async function resolveTenantFromWebhook(wabaId?: string, phoneNumberId?: 
 }
 
 // Ingest incoming webhook payload, persist to DB with tenant scoping, and trigger isolated SSE push
-export async function processInboundWebhookPayload(body: any): Promise<void> {
+export async function processInboundWebhookPayload(body: any, explicitTenantId?: string): Promise<void> {
   if (body?.object !== 'whatsapp_business_account') return;
 
   const entries = body.entry || [];
@@ -113,7 +113,19 @@ export async function processInboundWebhookPayload(body: any): Promise<void> {
       if (!value) continue;
 
       const phoneNumberId = value.metadata?.phone_number_id;
-      const tenantMatch = await resolveTenantFromWebhook(wabaId, phoneNumberId);
+      
+      // If routed via /whatsapp-webhook/:tenantId, use that tenant immediately
+      let tenantMatch = null;
+      if (explicitTenantId) {
+        const directChannel = (await db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE tenant_id = ? LIMIT 1').get(explicitTenantId)) as { id: string; tenant_id: string } | undefined;
+        if (directChannel) {
+          tenantMatch = { tenantId: directChannel.tenant_id, channelId: directChannel.id };
+        }
+      }
+
+      if (!tenantMatch) {
+        tenantMatch = await resolveTenantFromWebhook(wabaId, phoneNumberId);
+      }
 
       if (!tenantMatch) {
         console.warn(`[Webhook Router] Unmapped inbound event for WABA ${wabaId} / Phone ${phoneNumberId}. Skipping.`);

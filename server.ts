@@ -3,14 +3,16 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
-import { initDatabase } from './server/db.js';
+import { initDatabase, db } from './server/db.js';
 import { saasRouter } from './server/routes.js';
 import { processInboundWebhookPayload } from './server/multiTenantWebhook.js';
 import {
   getAppBaseUrl,
   getWhatsAppWebhookPath,
   getWhatsAppWebhookUrl,
+  getTenantWebhookUrl,
   getPrimaryVerifyToken,
+  generateTenantVerifyToken,
   verifyWebhookToken,
   verifyMetaHubSignature
 } from './server/webhookConfig.js';
@@ -21,6 +23,7 @@ import {
   testWebhookVerificationProbe,
   runFullDiagnostics
 } from './server/webhookDiagnostics.js';
+import { autoRegisterMetaWebhook } from './server/whatsappConnect.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -489,10 +492,14 @@ app.get('/api/whatsapp/media/:mediaId', async (req, res) => {
   }
 });
 
-// Supported webhook paths (handles both /api/whatsapp/webhook and /webhook, with or without trailing slash)
+// Supported webhook paths (global, tenant-specific, and WhatsJet /whatsapp-webhook/{vendorUid} routes)
 const WEBHOOK_PATHS = [
   '/api/whatsapp/webhook',
   '/api/whatsapp/webhook/',
+  '/api/whatsapp/webhook/:tenantId',
+  '/api/whatsapp/webhook/:tenantId/',
+  '/whatsapp-webhook/:tenantId',
+  '/whatsapp-webhook/:tenantId/',
   '/webhook',
   '/webhook/'
 ];
@@ -504,6 +511,7 @@ const WEBHOOK_PATHS = [
 // 3. Exact hub.challenge returned as text/plain
 // 4. HTTP 403 on mismatch (no HTML, no JSON, no redirects)
 app.get(WEBHOOK_PATHS, async (req, res) => {
+  const tenantId = req.params?.tenantId as string | undefined;
   const mode = (
     req.query['hub.mode'] || 
     (req.query.hub as any)?.mode || 
@@ -527,6 +535,7 @@ app.get(WEBHOOK_PATHS, async (req, res) => {
 
   console.log('[Meta Webhook GET Request]', {
     path: req.path,
+    tenantId: tenantId || 'global',
     mode,
     hasToken: Boolean(token),
     hasChallenge: Boolean(challenge)
@@ -534,16 +543,24 @@ app.get(WEBHOOK_PATHS, async (req, res) => {
 
   // Verification request from Meta Developer Dashboard / WhatsApp Cloud API
   if (mode === 'subscribe' && challenge !== undefined) {
-    const isTokenMatch = await verifyWebhookToken(token);
+    const isTokenMatch = await verifyWebhookToken(token, tenantId);
 
     if (isTokenMatch) {
-      console.log(`[Meta Webhook] Successfully verified with challenge: ${challenge}`);
+      console.log(`[Meta Webhook] Successfully verified with challenge: ${challenge} (tenant: ${tenantId || 'global'})`);
+      
+      // If verified for a specific tenant, record webhook_verified_at in database
+      if (tenantId) {
+        try {
+          await db.prepare('UPDATE whatsapp_channels SET webhook_verified_at = ? WHERE tenant_id = ?').run(Date.now(), tenantId);
+        } catch (_) {}
+      }
+
       return res
         .status(200)
         .set('Content-Type', 'text/plain; charset=utf-8')
         .send(String(challenge));
     } else {
-      console.warn(`[Meta Webhook] Verification rejected: Verify token mismatch`);
+      console.warn(`[Meta Webhook] Verification rejected for tenant: ${tenantId || 'global'}`);
       return res
         .status(403)
         .set('Content-Type', 'text/plain; charset=utf-8')
@@ -572,6 +589,7 @@ app.post(WEBHOOK_PATHS, async (req: any, res) => {
     const body = req.body;
     const rawBody = req.rawBody;
     const hubSignature = req.headers['x-hub-signature-256'] as string | undefined;
+    const explicitTenantId = req.params?.tenantId as string | undefined;
 
     // Extract WABA ID & Phone Number ID from incoming payload
     const firstEntry = body?.entry?.[0];
@@ -584,15 +602,16 @@ app.post(WEBHOOK_PATHS, async (req: any, res) => {
       rawBody,
       hubSignatureHeader: hubSignature,
       wabaId,
-      phoneNumberId
+      phoneNumberId,
+      tenantId: explicitTenantId
     });
 
     if (sigCheck.required && !sigCheck.isValid) {
       console.warn(`[Meta Webhook POST] Signature rejected: ${sigCheck.reason}`);
       await logWebhookEvent({
-        tenantId: null,
+        tenantId: explicitTenantId || null,
         eventType: 'signature_failed',
-        payload: { reason: sigCheck.reason, wabaId, phoneNumberId },
+        payload: { reason: sigCheck.reason, wabaId, phoneNumberId, explicitTenantId },
         isError: true
       });
       return res
@@ -609,7 +628,7 @@ app.post(WEBHOOK_PATHS, async (req: any, res) => {
       try {
         if (body?.object === 'whatsapp_business_account') {
           // Multi-tenant database routing & isolated tenant SSE push
-          await processInboundWebhookPayload(body);
+          await processInboundWebhookPayload(body, explicitTenantId);
 
           const entries = body.entry || [];
           for (const entry of entries) {
@@ -660,7 +679,7 @@ app.post(WEBHOOK_PATHS, async (req: any, res) => {
       } catch (asyncErr) {
         console.error('[Async Inbound Webhook Error]:', asyncErr);
         await logWebhookEvent({
-          tenantId: null,
+          tenantId: explicitTenantId || null,
           eventType: 'async_inbound_error',
           payload: { error: String(asyncErr) },
           isError: true
@@ -675,11 +694,11 @@ app.post(WEBHOOK_PATHS, async (req: any, res) => {
   }
 });
 
-// Proxy: 1-Click Auto Setup Webhook via Meta Graph API (WhatsJet flow)
-// Registers webhook callback on Meta App, connects WABA via subscribed_apps, and fetches phone numbers
+// Proxy: 1-Click Auto Setup Webhook via Meta Graph API (WhatsJet automated flow)
+// Registers webhook callback on Meta App, connects WABA via subscribed_apps, and fetches phone numbers automatically
 app.post('/api/whatsapp/auto-setup', async (req, res) => {
   try {
-    const { appId, appSecret, accessToken, wabaId, webhookUrl, verifyToken } = req.body;
+    const { appId, appSecret, accessToken, wabaId, tenantId } = req.body;
 
     if (!appId || !appSecret || !accessToken || !wabaId) {
       return res.status(400).json({
@@ -688,171 +707,36 @@ app.post('/api/whatsapp/auto-setup', async (req, res) => {
       });
     }
 
-    const cleanAppId = String(appId).trim();
-    const cleanAppSecret = String(appSecret).trim();
-    const cleanToken = String(accessToken).trim();
-    const cleanWabaId = String(wabaId).trim();
+    const result = await autoRegisterMetaWebhook({
+      tenantId: tenantId ? String(tenantId).trim() : undefined,
+      appId: String(appId).trim(),
+      appSecret: String(appSecret).trim(),
+      accessToken: String(accessToken).trim(),
+      wabaId: String(wabaId).trim(),
+      req
+    });
 
-    // Cache App Secret for payload signature checks
-    configuredAppSecret = cleanAppSecret;
-
-    const effectiveVerifyToken = String(verifyToken || getPrimaryVerifyToken()).trim();
-    const effectivePublicUrl = webhookUrl 
-      ? String(webhookUrl).trim() 
-      : getWhatsAppWebhookUrl();
-
-    const resultLog: Array<{ step: string; status: 'success' | 'failed' | 'warning'; message: string; details?: any }> = [];
-
-    // Step 1: Subscribe webhook callback URL to Meta App (connectBaseWebhook in WhatsJet)
-    console.log(`[AutoSetup] Registering webhook for App ${cleanAppId} at ${effectivePublicUrl}...`);
-    const appAccessToken = `${cleanAppId}|${cleanAppSecret}`;
-    const subParams = new URLSearchParams();
-    subParams.append('object', 'whatsapp_business_account');
-    subParams.append('callback_url', effectivePublicUrl);
-    subParams.append('verify_token', effectiveVerifyToken);
-    subParams.append('fields', 'messages,message_template_quality_update,message_template_status_update,account_update,history,smb_app_state_sync,smb_message_echoes');
-
-    let subSuccess = false;
-    let subError: string | null = null;
-
-    try {
-      const subRes = await fetch(
-        `https://graph.facebook.com/v21.0/${cleanAppId}/subscriptions?access_token=${encodeURIComponent(appAccessToken)}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-          },
-          body: subParams.toString()
-        }
-      );
-
-      const subData = await subRes.json();
-      if (subRes.ok && subData?.success) {
-        subSuccess = true;
-        resultLog.push({
-          step: 'app_webhook_subscription',
-          status: 'success',
-          message: `Successfully registered webhook callback URL with Meta App ${cleanAppId}`,
-          details: subData
-        });
-      } else {
-        subError = subData?.error?.message || 'Meta rejected app webhook subscription.';
-        resultLog.push({
-          step: 'app_webhook_subscription',
-          status: 'failed',
-          message: subError || 'Meta rejected app webhook subscription.',
-          details: subData
-        });
-      }
-    } catch (err: any) {
-      subError = err?.message || 'Failed to call Meta subscriptions API';
-      resultLog.push({
-        step: 'app_webhook_subscription',
-        status: 'failed',
-        message: subError || 'Failed to call Meta subscriptions API'
-      });
-    }
-
-    // Step 2: Subscribe the WhatsApp Business Account (WABA) to the App (subscribed_apps)
-    console.log(`[AutoSetup] Subscribing WABA ${cleanWabaId} to app...`);
-    let wabaSuccess = false;
-    let wabaError: string | null = null;
-
-    try {
-      const wabaRes = await fetch(`https://graph.facebook.com/v21.0/${cleanWabaId}/subscribed_apps`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${cleanToken}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      const wabaData = await wabaRes.json();
-      if (wabaRes.ok && wabaData?.success) {
-        wabaSuccess = true;
-        resultLog.push({
-          step: 'waba_subscribed_apps',
-          status: 'success',
-          message: `Successfully connected WhatsApp Business Account (${cleanWabaId}) to Webhook events`,
-          details: wabaData
-        });
-      } else {
-        wabaError = wabaData?.error?.message || 'Failed to subscribe WABA to app';
-        resultLog.push({
-          step: 'waba_subscribed_apps',
-          status: 'failed',
-          message: wabaError || 'Failed to subscribe WABA to app',
-          details: wabaData
-        });
-      }
-    } catch (err: any) {
-      wabaError = err?.message || 'Failed to connect WABA to app';
-      resultLog.push({
-        step: 'waba_subscribed_apps',
-        status: 'failed',
-        message: wabaError || 'Failed to connect WABA to app'
-      });
-    }
-
-    // Step 3: Discover Phone Numbers registered under WABA
-    console.log(`[AutoSetup] Discovering registered phone numbers under WABA ${cleanWabaId}...`);
-    let phoneNumbers: any[] = [];
-    try {
-      const phoneRes = await fetch(`https://graph.facebook.com/v21.0/${cleanWabaId}/phone_numbers`, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${cleanToken}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      const phoneData = await phoneRes.json();
-      if (phoneRes.ok && phoneData?.data) {
-        phoneNumbers = phoneData.data;
-        resultLog.push({
-          step: 'discover_phone_numbers',
-          status: 'success',
-          message: `Found ${phoneNumbers.length} phone number(s) in WhatsApp Business Account`,
-          details: phoneNumbers
-        });
-      } else {
-        resultLog.push({
-          step: 'discover_phone_numbers',
-          status: 'warning',
-          message: phoneData?.error?.message || 'Could not auto-list phone numbers (verify token permissions)',
-          details: phoneData
-        });
-      }
-    } catch (err: any) {
-      resultLog.push({
-        step: 'discover_phone_numbers',
-        status: 'warning',
-        message: err?.message || 'Failed to discover phone numbers'
-      });
-    }
-
-    const overallSuccess = subSuccess && wabaSuccess;
-
-    if (overallSuccess) {
+    if (result.success && result.primaryPhone) {
       saveSavedCredentials({
-        appId: cleanAppId,
-        appSecret: cleanAppSecret,
-        accessToken: cleanToken,
-        wabaId: cleanWabaId,
-        phoneNumberId: phoneNumbers.length > 0 ? phoneNumbers[0].id : undefined
+        appId: String(appId).trim(),
+        appSecret: String(appSecret).trim(),
+        accessToken: String(accessToken).trim(),
+        wabaId: String(wabaId).trim(),
+        phoneNumberId: result.primaryPhone.id
       });
     }
 
     return res.json({
-      success: overallSuccess,
-      subSuccess,
-      wabaSuccess,
-      phoneNumbers,
-      recommendedPhoneNumberId: phoneNumbers.length > 0 ? phoneNumbers[0].id : null,
-      primaryPhone: phoneNumbers.length > 0 ? phoneNumbers[0] : null,
-      callbackUrlUsed: effectivePublicUrl,
-      verifyTokenUsed: effectiveVerifyToken,
-      log: resultLog,
-      error: !subSuccess ? subError : !wabaSuccess ? wabaError : null
+      success: result.success,
+      subSuccess: result.subSuccess,
+      wabaSuccess: result.wabaSuccess,
+      callbackUrlUsed: result.callbackUrl,
+      verifyTokenUsed: result.verifyToken,
+      phoneNumbers: result.phoneNumbers,
+      primaryPhone: result.primaryPhone,
+      recommendedPhoneNumberId: result.primaryPhone?.id || null,
+      log: result.log,
+      error: result.error
     });
   } catch (err: any) {
     console.error('[AutoSetup Error]:', err);
@@ -981,15 +865,18 @@ app.get('/api/whatsapp/live-events', (req, res) => {
 });
 
 // Endpoint providing permanent Meta-accessible production webhook configuration & metrics
-app.get('/api/whatsapp/public-webhook-info', async (_req, res) => {
-  const webhookUrl = getWhatsAppWebhookUrl();
-  const verifyToken = getPrimaryVerifyToken();
+app.get('/api/whatsapp/public-webhook-info', async (req, res) => {
+  const tenantId = (req.query.tenantId as string) || (req.headers['x-tenant-id'] as string) || undefined;
+  const baseUrl = getAppBaseUrl(req);
+  const webhookUrl = tenantId ? getTenantWebhookUrl(tenantId, req) : getWhatsAppWebhookUrl(req);
+  const verifyToken = tenantId ? generateTenantVerifyToken(tenantId) : getPrimaryVerifyToken();
   const metrics = getWebhookMetrics();
 
   res.json({
     success: true,
-    baseUrl: getAppBaseUrl(),
-    webhookPath: getWhatsAppWebhookPath(),
+    baseUrl,
+    tenantId,
+    webhookUrl,
     recommendedWebhookUrl: webhookUrl,
     verifyToken,
     isHttps: webhookUrl.startsWith('https://'),
