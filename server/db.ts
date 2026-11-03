@@ -1,5 +1,4 @@
 import pg from 'pg';
-import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -13,32 +12,31 @@ const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, '..', 'data');
 
 const databaseUrl = process.env.DATABASE_URL;
-export const isPostgres = Boolean(databaseUrl && databaseUrl.trim().length > 0);
 
-let pool: pg.Pool | null = null;
-let sqliteDb: DatabaseSync | null = null;
-
-if (isPostgres) {
-  const connStr = databaseUrl!.trim();
-  const isLocal = connStr.includes('localhost') || connStr.includes('127.0.0.1');
-  pool = new Pool({
-    connectionString: connStr,
-    ssl: isLocal ? false : { rejectUnauthorized: false },
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
-  });
-  console.log('[Database] Initialized PostgreSQL connection pool with DATABASE_URL');
-} else {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  const DB_PATH = path.join(DATA_DIR, 'saas_platform.sqlite');
-  sqliteDb = new DatabaseSync(DB_PATH);
-  sqliteDb.exec('PRAGMA journal_mode = WAL;');
-  sqliteDb.exec('PRAGMA foreign_keys = ON;');
-  console.log('[Database] Initialized local SQLite fallback at', DB_PATH);
+if (!databaseUrl) {
+  console.warn('================================================================');
+  console.warn('[Database Notice] DATABASE_URL environment variable is not set!');
+  console.warn('PostgreSQL pool will attempt connection to local postgres default.');
+  console.warn('Set DATABASE_URL in Render or .env for live cloud PostgreSQL.');
+  console.warn('================================================================');
 }
+
+const connStr = (databaseUrl || 'postgres://postgres:postgres@localhost:5432/whatchat').trim();
+const isLocal = connStr.includes('localhost') || connStr.includes('127.0.0.1');
+
+export const pool = new Pool({
+  connectionString: connStr,
+  ssl: isLocal ? false : { rejectUnauthorized: false },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+pool.on('error', (err) => {
+  console.error('[PostgreSQL Pool Error]:', err);
+});
+
+console.log(`[Database] Pure PostgreSQL client initialized (${isLocal ? 'Local' : 'Live Cloud with SSL'})`);
 
 /**
  * Translates ? placeholders to PostgreSQL $1, $2, ... placeholders.
@@ -49,36 +47,28 @@ function toPgSql(sql: string): string {
 }
 
 /**
- * Sanitizes parameters: converts undefined to null so SQLite/Postgres never fail on binding
+ * Sanitizes parameters: converts undefined to null so PostgreSQL parameter binding never fails
  */
 function sanitizeParams(params: any[] = []): any[] {
   return params.map(p => (p === undefined ? null : p));
 }
 
 /**
- * Unified Database Interface: supports both PostgreSQL and SQLite
+ * Pure PostgreSQL Database Interface
  */
 export const db = {
-  isPostgres: () => isPostgres,
+  isPostgres: () => true,
 
   async query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
     const cleanParams = sanitizeParams(params);
-    if (pool) {
-      const res = await pool.query(toPgSql(sql), cleanParams);
-      return res.rows as T[];
-    } else {
-      return sqliteDb!.prepare(sql).all(...cleanParams) as T[];
-    }
+    const res = await pool.query(toPgSql(sql), cleanParams);
+    return res.rows as T[];
   },
 
   async get<T = any>(sql: string, params: any[] = []): Promise<T | undefined> {
     const cleanParams = sanitizeParams(params);
-    if (pool) {
-      const res = await pool.query(toPgSql(sql), cleanParams);
-      return (res.rows[0] as T) || undefined;
-    } else {
-      return (sqliteDb!.prepare(sql).get(...cleanParams) as T) || undefined;
-    }
+    const res = await pool.query(toPgSql(sql), cleanParams);
+    return (res.rows[0] as T) || undefined;
   },
 
   async all<T = any>(sql: string, params: any[] = []): Promise<T[]> {
@@ -87,21 +77,12 @@ export const db = {
 
   async run(sql: string, params: any[] = []): Promise<{ changes: number }> {
     const cleanParams = sanitizeParams(params);
-    if (pool) {
-      const res = await pool.query(toPgSql(sql), cleanParams);
-      return { changes: res.rowCount || 0 };
-    } else {
-      sqliteDb!.prepare(sql).run(...cleanParams);
-      return { changes: 1 };
-    }
+    const res = await pool.query(toPgSql(sql), cleanParams);
+    return { changes: res.rowCount || 0 };
   },
 
   async exec(sql: string): Promise<void> {
-    if (pool) {
-      await pool.query(sql);
-    } else {
-      sqliteDb!.exec(sql);
-    }
+    await pool.query(sql);
   },
 
   prepare(sql: string) {
@@ -123,7 +104,7 @@ export const db = {
 };
 
 export async function initDatabase() {
-  console.log(`[Database] Initializing schema (${isPostgres ? 'PostgreSQL' : 'SQLite'})...`);
+  console.log('[Database] Initializing PostgreSQL schema & relations...');
 
   const ddlStatements = [
     `CREATE TABLE IF NOT EXISTS platform_config (
@@ -359,7 +340,7 @@ export async function initDatabase() {
       last_request BIGINT NOT NULL
     );`,
 
-    // Indexes
+    // PostgreSQL Indexes
     `CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);`,
     `CREATE INDEX IF NOT EXISTS idx_messages_meta_id ON messages(meta_message_id);`,
     `CREATE INDEX IF NOT EXISTS idx_channels_phone_id ON whatsapp_channels(phone_number_id);`,
@@ -376,11 +357,11 @@ export async function initDatabase() {
     try {
       await db.exec(ddl);
     } catch (err: any) {
-      console.warn('[Database] DDL notice:', err?.message || err);
+      console.warn('[PostgreSQL DDL Notice]:', err?.message || err);
     }
   }
 
-  // Safe schema migrations for existing columns
+  // Safe schema migrations for existing columns in PostgreSQL
   const migrationColumns = [
     { table: 'users', col: 'mobile', type: 'TEXT' },
     { table: 'users', col: 'phone_verified', type: 'INTEGER DEFAULT 0' },
@@ -404,15 +385,12 @@ export async function initDatabase() {
 
   for (const m of migrationColumns) {
     try {
-      const sql = isPostgres
-        ? `ALTER TABLE ${m.table} ADD COLUMN IF NOT EXISTS ${m.col} ${m.type};`
-        : `ALTER TABLE ${m.table} ADD COLUMN ${m.col} ${m.type};`;
-      await db.exec(sql);
+      await db.exec(`ALTER TABLE ${m.table} ADD COLUMN IF NOT EXISTS ${m.col} ${m.type};`);
     } catch (_) {}
   }
 
   await seedDefaultData();
-  console.log('[Database] Schema initialization and seeding complete.');
+  console.log('[Database] PostgreSQL schema initialization and seeding complete.');
 }
 
 async function seedDefaultData() {
@@ -499,6 +477,6 @@ async function seedDefaultData() {
       }
     }
   } catch (err) {
-    console.warn('[DB Seed] Legacy credentials migration notice:', err);
+    console.warn('[PostgreSQL DB Seed] Legacy credentials migration notice:', err);
   }
 }

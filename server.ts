@@ -1110,7 +1110,7 @@ app.post('/api/whatsapp/test-webhook', async (req, res) => {
 
 // Start dev server with Vite middlewares or static files
 async function startServer() {
-  // Initialize Database (PostgreSQL if DATABASE_URL is set, else SQLite)
+  // Initialize PostgreSQL Database schema & relations
   await initDatabase();
 
   if (process.env.NODE_ENV !== 'production') {

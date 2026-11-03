@@ -28,8 +28,8 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server ./server
 COPY --from=builder /app/server.ts ./server.ts
 
-# Ensure data directory exists for SQLite
-RUN mkdir -p /app/data
+# Ensure persistent uploads directory exists
+RUN mkdir -p /app/public/uploads
 
 EXPOSE 3000
 

@@ -42,7 +42,6 @@ export default function App() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
 
   // Multi-Tenant SaaS State
-  const [showLandingPage, setShowLandingPage] = useState<boolean>(false);
   const [isConnectModalOpen, setIsConnectModalOpen] = useState<boolean>(false);
   const [isSuperAdminOpen, setIsSuperAdminOpen] = useState<boolean>(false);
   const [isBillingModalOpen, setIsBillingModalOpen] = useState<boolean>(false);
@@ -547,16 +546,23 @@ export default function App() {
   // Visible on mobile ONLY when on main tab pages so it never covers the chat input bar
   const showMobileBottomNav = activeTab !== 'chats' || !activeConversationId;
 
-  // Responsive device check for mobile vs PC view
-  const [isMobileScreen, setIsMobileScreen] = useState<boolean>(
-    typeof window !== 'undefined' ? window.innerWidth < 768 : false
+  // Responsive screen check: Web Form (Desktop >= 1024px) vs Mobile/Tablet views (< 1024px)
+  const [isMobileOrTab, setIsMobileOrTab] = useState<boolean>(
+    typeof window !== 'undefined' ? window.innerWidth < 1024 : false
   );
 
   useEffect(() => {
-    const handleResize = () => setIsMobileScreen(window.innerWidth < 768);
+    const handleResize = () => setIsMobileOrTab(window.innerWidth < 1024);
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  // Controls whether user has entered the active workspace
+  // On startup:
+  // - Web Form (desktop/laptop >= 1024px) starts on Home Page (MarketingLandingPage)
+  // - Mobile / Tablet views (< 1024px) start on Login Page (MobileAuthScreen)
+  const [hasEnteredApp, setHasEnteredApp] = useState<boolean>(false);
+  const [forceDesktopLanding, setForceDesktopLanding] = useState<boolean>(false);
 
   const handleLogout = () => {
     localStorage.removeItem('whatchat_saas_token');
@@ -564,14 +570,17 @@ export default function App() {
     setSaasTenant(null);
     setSaasUser(null);
     setActiveConversationId(null);
+    setHasEnteredApp(false);
+    setForceDesktopLanding(false);
   };
 
   // Determine if active user possesses Super Admin privileges
   const isSuperAdmin = saasUser?.role === 'super_admin' || Boolean(localStorage.getItem('whatchat_admin_token'));
 
-  // IF NOT AUTHENTICATED OR showLandingPage IS TRIGGERED:
-  if (!saasToken || showLandingPage) {
-    if (isMobileScreen && !showLandingPage) {
+  // IF AT INITIAL START, NOT ENTERED, NOT AUTHENTICATED, OR LANDING PAGE REQUESTED:
+  if (!hasEnteredApp || !saasToken || forceDesktopLanding) {
+    // 1. Mobile or Tablet view at start -> Show Login Page (MobileAuthScreen)
+    if (isMobileOrTab && !forceDesktopLanding) {
       return (
         <>
           <MobileAuthScreen
@@ -580,10 +589,10 @@ export default function App() {
                 setSaasToken(authData.token);
                 setSaasTenant(authData.tenant);
               }
-              setShowLandingPage(false);
+              setHasEnteredApp(true);
             }}
             onOpenSuperAdmin={() => setIsSuperAdminOpen(true)}
-            onOpenDesktopLanding={() => setShowLandingPage(true)}
+            onOpenDesktopLanding={() => setForceDesktopLanding(true)}
           />
           <SuperAdminPanel
             isOpen={isSuperAdminOpen}
@@ -594,15 +603,18 @@ export default function App() {
       );
     }
 
+    // 2. Web Form (Desktop >= 1024px) at start -> Show Home Page (MarketingLandingPage)
     return (
       <>
         <MarketingLandingPage
+          isLoggedIn={Boolean(saasToken)}
           onEnterApp={(authData) => {
             if (authData?.token) {
               setSaasToken(authData.token);
               setSaasTenant(authData.tenant);
             }
-            setShowLandingPage(false);
+            setHasEnteredApp(true);
+            setForceDesktopLanding(false);
           }}
           onOpenSuperAdmin={() => {
             setIsSuperAdminOpen(true);
@@ -628,7 +640,7 @@ export default function App() {
         onToggleTheme={() => setTheme(prev => prev === 'dark' ? 'light' : 'dark')}
         onOpenSettings={() => setActiveTab('settings')}
         onOpenSuperAdmin={isSuperAdmin ? () => setIsSuperAdminOpen(true) : undefined}
-        onOpenLanding={() => setShowLandingPage(true)}
+        onOpenLanding={() => { setHasEnteredApp(false); setForceDesktopLanding(true); }}
         onLogout={handleLogout}
         isInstallable={isInstallable}
         onInstallPWA={installPWA}

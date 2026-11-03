@@ -26,11 +26,13 @@ import {
 interface MarketingLandingPageProps {
   onEnterApp: (authData?: { token: string; user: any; tenant: any }) => void;
   onOpenSuperAdmin: () => void;
+  isLoggedIn?: boolean;
 }
 
 export const MarketingLandingPage: React.FC<MarketingLandingPageProps> = ({
   onEnterApp,
-  onOpenSuperAdmin
+  onOpenSuperAdmin,
+  isLoggedIn
 }) => {
   const [authMode, setAuthMode] = useState<'login' | 'register' | null>(null);
   const [billingCycle, setBillingCycle] = useState<'monthly' | 'yearly'>('monthly');
@@ -208,18 +210,30 @@ export const MarketingLandingPage: React.FC<MarketingLandingPageProps> = ({
           </nav>
 
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => { setAuthMode('login'); setAuthError(null); }}
-              className="px-4 py-2 text-sm font-semibold text-slate-300 hover:text-white transition-colors"
-            >
-              Sign In
-            </button>
-            <button
-              onClick={() => { setAuthMode('register'); setAuthError(null); }}
-              className="px-5 py-2.5 text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl shadow-lg shadow-emerald-500/20 transition-all transform hover:-translate-y-0.5"
-            >
-              Start Free Trial
-            </button>
+            {isLoggedIn ? (
+              <button
+                onClick={() => onEnterApp()}
+                className="px-5 py-2.5 text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl shadow-lg shadow-emerald-500/20 transition-all flex items-center gap-2 transform hover:-translate-y-0.5"
+              >
+                <span>Go to Workspace</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={() => { setAuthMode('login'); setAuthError(null); }}
+                  className="px-4 py-2 text-sm font-semibold text-slate-300 hover:text-white transition-colors"
+                >
+                  Sign In
+                </button>
+                <button
+                  onClick={() => { setAuthMode('register'); setAuthError(null); }}
+                  className="px-5 py-2.5 text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl shadow-lg shadow-emerald-500/20 transition-all transform hover:-translate-y-0.5"
+                >
+                  Start Free Trial
+                </button>
+              </>
+            )}
             <button
               onClick={onOpenSuperAdmin}
               title="Super Admin Settings"
