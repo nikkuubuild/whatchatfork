@@ -1,3 +1,8 @@
+databases:
+  - name: whatchat-db
+    plan: free
+    region: singapore
+
 services:
   - type: web
     name: whatchat
@@ -11,3 +16,7 @@ services:
         value: production
       - key: PORT
         value: 10000
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whatchat-db
+          property: connectionString
