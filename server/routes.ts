@@ -427,7 +427,13 @@ saasRouter.post('/whatsapp/channels/:channelId/disconnect', authenticateToken, r
 // ==========================================
 
 saasRouter.get('/whatsapp/events', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res: Response) => {
-  const tenantId = req.tenantId!;
+  let tenantId = req.tenantId;
+  if (!tenantId) {
+    const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+      || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+    tenantId = defaultTenant?.id || 'tenant_default_01';
+    req.tenantId = tenantId;
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',

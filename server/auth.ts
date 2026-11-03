@@ -188,17 +188,21 @@ export async function requireSuperAdminAuth(req: AuthenticatedRequest, res: Resp
 }
 
 // Middleware: Strict Tenant Access Check
-export function requireTenant(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function requireTenant(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   if (!req.user) {
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
 
   if (req.user.role === 'super_admin') {
     // Super admin can impersonate or inspect any tenant via header or query
-    const targetTenantId = (req.headers['x-tenant-id'] as string) || (req.query.tenantId as string) || req.user.tenantId;
-    if (targetTenantId) {
-      req.tenantId = targetTenantId;
+    let targetTenantId = (req.headers['x-tenant-id'] as string) || (req.query.tenantId as string) || req.user.tenantId;
+    if (!targetTenantId) {
+      // Pick default or first tenant workspace so super_admin views can function
+      const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+        || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+      targetTenantId = defaultTenant?.id || 'tenant_default_01';
     }
+    req.tenantId = targetTenantId;
     return next();
   }
 

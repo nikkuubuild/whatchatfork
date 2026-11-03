@@ -49,26 +49,35 @@ function toPgSql(sql: string): string {
 }
 
 /**
+ * Sanitizes parameters: converts undefined to null so SQLite/Postgres never fail on binding
+ */
+function sanitizeParams(params: any[] = []): any[] {
+  return params.map(p => (p === undefined ? null : p));
+}
+
+/**
  * Unified Database Interface: supports both PostgreSQL and SQLite
  */
 export const db = {
   isPostgres: () => isPostgres,
 
   async query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    const cleanParams = sanitizeParams(params);
     if (pool) {
-      const res = await pool.query(toPgSql(sql), params);
+      const res = await pool.query(toPgSql(sql), cleanParams);
       return res.rows as T[];
     } else {
-      return sqliteDb!.prepare(sql).all(...params) as T[];
+      return sqliteDb!.prepare(sql).all(...cleanParams) as T[];
     }
   },
 
   async get<T = any>(sql: string, params: any[] = []): Promise<T | undefined> {
+    const cleanParams = sanitizeParams(params);
     if (pool) {
-      const res = await pool.query(toPgSql(sql), params);
+      const res = await pool.query(toPgSql(sql), cleanParams);
       return (res.rows[0] as T) || undefined;
     } else {
-      return (sqliteDb!.prepare(sql).get(...params) as T) || undefined;
+      return (sqliteDb!.prepare(sql).get(...cleanParams) as T) || undefined;
     }
   },
 
@@ -77,11 +86,12 @@ export const db = {
   },
 
   async run(sql: string, params: any[] = []): Promise<{ changes: number }> {
+    const cleanParams = sanitizeParams(params);
     if (pool) {
-      const res = await pool.query(toPgSql(sql), params);
+      const res = await pool.query(toPgSql(sql), cleanParams);
       return { changes: res.rowCount || 0 };
     } else {
-      sqliteDb!.prepare(sql).run(...params);
+      sqliteDb!.prepare(sql).run(...cleanParams);
       return { changes: 1 };
     }
   },
