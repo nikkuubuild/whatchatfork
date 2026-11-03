@@ -2,110 +2,31 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { spawn, ChildProcess } from 'child_process';
 import crypto from 'crypto';
 import { initDatabase } from './server/db.js';
 import { saasRouter } from './server/routes.js';
 import { processInboundWebhookPayload } from './server/multiTenantWebhook.js';
+import {
+  getAppBaseUrl,
+  getWhatsAppWebhookPath,
+  getWhatsAppWebhookUrl,
+  getPrimaryVerifyToken,
+  verifyWebhookToken,
+  verifyMetaHubSignature
+} from './server/webhookConfig.js';
+import {
+  initializeWebhookMetrics,
+  getWebhookMetrics,
+  logWebhookEvent,
+  testWebhookVerificationProbe,
+  runFullDiagnostics
+} from './server/webhookDiagnostics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Stored App Secret for HMAC-SHA256 signature verification
 let configuredAppSecret: string | null = process.env.WHATSAPP_APP_SECRET || null;
-
-// Cloudflare public tunnel state for external Meta Webhooks reachability
-let publicTunnelUrl: string | null = null;
-let tunnelProcess: ChildProcess | null = null;
-let shouldTunnelRun = true;
-let tunnelRestartTimeout: NodeJS.Timeout | null = null;
-
-function startPublicWebhookTunnel(port: number) {
-  const binaryName = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
-  const binaryPath = path.join(__dirname, 'bin', binaryName);
-  if (!fs.existsSync(binaryPath)) {
-    console.warn('[Tunnel] cloudflared binary not found at', binaryPath);
-    return;
-  }
-
-  if (tunnelRestartTimeout) {
-    clearTimeout(tunnelRestartTimeout);
-    tunnelRestartTimeout = null;
-  }
-
-  if (tunnelProcess) {
-    try {
-      tunnelProcess.removeAllListeners();
-      tunnelProcess.kill('SIGKILL');
-    } catch (_) {}
-    tunnelProcess = null;
-  }
-
-  try {
-    console.log('[Tunnel] Launching HTTP/2 (IPv4) public tunnel to bypass dev session cookie protection...');
-    tunnelProcess = spawn(binaryPath, [
-      'tunnel',
-      '--protocol',
-      'http2',
-      '--edge-ip-version',
-      '4',
-      '--url',
-      `http://localhost:${port}`,
-      '--no-autoupdate'
-    ]);
-
-    const handleData = (chunk: Buffer) => {
-      const text = chunk.toString();
-      const match = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
-      if (match && match[0]) {
-        publicTunnelUrl = match[0];
-        console.log(`\n============================================================`);
-        console.log(`>>> LIVE PUBLIC META WEBHOOK URL (NO COOKIE CHECK):`);
-        console.log(`>>> ${publicTunnelUrl}/api/whatsapp/webhook`);
-        console.log(`>>> VERIFY TOKEN: ${process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token'}`);
-        console.log(`============================================================\n`);
-
-        const savedCreds = loadSavedCredentials();
-        if (savedCreds.appId && savedCreds.appSecret && savedCreds.wabaId && savedCreds.accessToken) {
-          console.log('[Tunnel] Auto-registering new webhook with Meta Graph API in background...');
-          autoRegisterWebhookWithMeta(savedCreds, `${publicTunnelUrl}/api/whatsapp/webhook`).catch(e => {
-            console.warn('[Tunnel] Background auto-registration notice:', e?.message);
-          });
-        }
-      }
-    };
-
-    tunnelProcess.stdout?.on('data', handleData);
-    tunnelProcess.stderr?.on('data', handleData);
-
-    tunnelProcess.on('exit', (code, signal) => {
-      console.log(`[Tunnel] Process exited with code ${code}, signal ${signal}`);
-      if (shouldTunnelRun) {
-        console.log('[Tunnel] Auto-restarting tunnel in 3 seconds to maintain edge connectivity...');
-        tunnelRestartTimeout = setTimeout(() => {
-          startPublicWebhookTunnel(port);
-        }, 3000);
-      }
-    });
-
-    const cleanup = () => {
-      shouldTunnelRun = false;
-      try {
-        tunnelProcess?.kill();
-      } catch (_) {}
-    };
-    process.on('SIGTERM', cleanup);
-    process.on('SIGINT', cleanup);
-    process.on('exit', cleanup);
-  } catch (err) {
-    console.error('[Tunnel Error] Failed to launch tunnel:', err);
-    if (shouldTunnelRun) {
-      tunnelRestartTimeout = setTimeout(() => {
-        startPublicWebhookTunnel(port);
-      }, 5000);
-    }
-  }
-}
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -195,19 +116,20 @@ function broadcastSseEvent(event: WebhookEvent) {
   }
 }
 
-// Function to automatically register webhook with Meta Graph API
+// Function to automatically register webhook with Meta Graph API using permanent domain
 async function autoRegisterWebhookWithMeta(params: {
   appId: string;
   appSecret: string;
   accessToken: string;
   wabaId: string;
   verifyToken?: string;
-}, effectivePublicUrl: string) {
+}, effectivePublicUrl?: string) {
   const cleanAppId = String(params.appId).trim();
   const cleanAppSecret = String(params.appSecret).trim();
   const cleanToken = String(params.accessToken).trim();
   const cleanWabaId = String(params.wabaId).trim();
-  const effectiveVerifyToken = String(params.verifyToken || process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token').trim();
+  const effectiveVerifyToken = String(params.verifyToken || getPrimaryVerifyToken()).trim();
+  const callbackUrl = (effectivePublicUrl || getWhatsAppWebhookUrl()).trim();
 
   configuredAppSecret = cleanAppSecret;
   lastKnownToken = cleanToken;
@@ -215,11 +137,11 @@ async function autoRegisterWebhookWithMeta(params: {
   const appAccessToken = `${cleanAppId}|${cleanAppSecret}`;
   const subParams = new URLSearchParams();
   subParams.append('object', 'whatsapp_business_account');
-  subParams.append('callback_url', effectivePublicUrl);
+  subParams.append('callback_url', callbackUrl);
   subParams.append('verify_token', effectiveVerifyToken);
   subParams.append('fields', 'messages,message_template_quality_update,message_template_status_update,account_update,history,smb_app_state_sync,smb_message_echoes');
 
-  console.log(`[AutoRegister] Subscribing Meta App ${cleanAppId} to ${effectivePublicUrl}...`);
+  console.log(`[AutoRegister] Subscribing Meta App ${cleanAppId} to permanent webhook ${callbackUrl}...`);
   const subRes = await fetch(
     `https://graph.facebook.com/v21.0/${cleanAppId}/subscriptions?access_token=${encodeURIComponent(appAccessToken)}`,
     {
@@ -257,7 +179,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Test WhatsApp Cloud API Connection
+// Test WhatsApp Cloud API Connection (Inspects phone status, quality rating, and 2FA code status independently)
 app.post('/api/whatsapp/test-connection', async (req, res) => {
   try {
     const { token, phoneNumberId, wabaId } = req.body;
@@ -269,9 +191,9 @@ app.post('/api/whatsapp/test-connection', async (req, res) => {
       });
     }
 
-    // Probe Phone Number ID
+    // Probe Phone Number ID with comprehensive operational fields
     const phoneResponse = await fetch(
-      `https://graph.facebook.com/v21.0/${phoneNumberId}?fields=verified_name,code_verification_status,display_phone_number,quality_rating,name_status`,
+      `https://graph.facebook.com/v21.0/${phoneNumberId}?fields=verified_name,display_phone_number,quality_rating,name_status,status,code_verification_status,messaging_limit_tier`,
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -290,12 +212,17 @@ app.post('/api/whatsapp/test-connection', async (req, res) => {
       });
     }
 
+    // Ensure status fields are clearly delineated to avoid confusing 2FA OTP code expiry with phone status
+    phoneData.operational_status = phoneData.status || 'CONNECTED';
+    phoneData.two_factor_status = phoneData.code_verification_status || 'VERIFIED';
+
     // Optionally probe WABA if provided
     let wabaData = null;
+    let subscribedAppsData: any = null;
     if (wabaId) {
       try {
         const wabaResponse = await fetch(
-          `https://graph.facebook.com/v21.0/${wabaId}?fields=id,name,timezone_id,message_template_namespace`,
+          `https://graph.facebook.com/v21.0/${wabaId}?fields=id,name,timezone_id,account_review_status,message_template_namespace`,
           {
             headers: {
               Authorization: `Bearer ${token}`,
@@ -304,6 +231,18 @@ app.post('/api/whatsapp/test-connection', async (req, res) => {
           }
         );
         wabaData = await wabaResponse.json();
+
+        // Also probe WABA subscribed_apps
+        const subAppsResponse = await fetch(
+          `https://graph.facebook.com/v21.0/${wabaId}/subscribed_apps`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        subscribedAppsData = await subAppsResponse.json();
       } catch (e) {
         console.warn('WABA check error (non-fatal):', e);
       }
@@ -312,7 +251,8 @@ app.post('/api/whatsapp/test-connection', async (req, res) => {
     return res.json({
       success: true,
       phone: phoneData,
-      waba: wabaData
+      waba: wabaData,
+      wabaSubscribedApps: subscribedAppsData?.data || []
     });
   } catch (error: any) {
     console.error('Error during test-connection:', error);
@@ -558,8 +498,12 @@ const WEBHOOK_PATHS = [
 ];
 
 // Meta Webhook Verification (GET)
-app.get(WEBHOOK_PATHS, (req, res) => {
-  // Extract parameters from multiple possible query structures
+// Strictly fulfills Meta Cloud API verification specs:
+// 1. hub.mode === 'subscribe'
+// 2. hub.verify_token matching configured token via constant-time comparison
+// 3. Exact hub.challenge returned as text/plain
+// 4. HTTP 403 on mismatch (no HTML, no JSON, no redirects)
+app.get(WEBHOOK_PATHS, async (req, res) => {
   const mode = (
     req.query['hub.mode'] || 
     (req.query.hub as any)?.mode || 
@@ -584,143 +528,150 @@ app.get(WEBHOOK_PATHS, (req, res) => {
   console.log('[Meta Webhook GET Request]', {
     path: req.path,
     mode,
-    token: token ? '***' : undefined,
-    hasChallenge: Boolean(challenge),
-    queryKeys: Object.keys(req.query)
+    hasToken: Boolean(token),
+    hasChallenge: Boolean(challenge)
   });
 
-  // If Meta sends subscription verification request
+  // Verification request from Meta Developer Dashboard / WhatsApp Cloud API
   if (mode === 'subscribe' && challenge !== undefined) {
-    const expectedToken = (process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token').trim();
-    const providedToken = String(token || '').trim();
-
-    // Verify token: accept expectedToken, default whatscloud_token, whatscloud,
-    // or any non-empty token when no custom environment token is set.
-    const isTokenMatch = 
-      providedToken === expectedToken || 
-      providedToken === 'whatscloud_token' || 
-      providedToken === 'whatscloud' ||
-      (!process.env.WHATSAPP_VERIFY_TOKEN && providedToken.length > 0);
+    const isTokenMatch = await verifyWebhookToken(token);
 
     if (isTokenMatch) {
       console.log(`[Meta Webhook] Successfully verified with challenge: ${challenge}`);
-      // CRITICAL: Meta requires strict HTTP 200 with Content-Type text/plain and raw challenge string
       return res
         .status(200)
         .set('Content-Type', 'text/plain; charset=utf-8')
         .send(String(challenge));
     } else {
-      console.warn(`[Meta Webhook] Token mismatch. Provided: "${providedToken}", Expected: "${expectedToken}"`);
+      console.warn(`[Meta Webhook] Verification rejected: Verify token mismatch`);
       return res
         .status(403)
         .set('Content-Type', 'text/plain; charset=utf-8')
-        .send('Forbidden: Verify token mismatch');
+        .send('Forbidden');
     }
   }
 
-  // Friendly check if accessed directly in browser or by health checker
-  return res.status(200).json({
-    status: 'active',
-    service: 'WhatsCloud Meta WhatsApp Cloud API Webhook Endpoint',
-    endpoints: ['/api/whatsapp/webhook', '/webhook'],
-    expectedVerifyToken: process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token',
-    instructions: 'Enter this URL and Verify Token in Meta App Dashboard -> WhatsApp -> Configuration -> Webhook -> Edit'
-  });
+  // Reject non-subscription or malformed verification queries with HTTP 400 plain text
+  return res
+    .status(400)
+    .set('Content-Type', 'text/plain; charset=utf-8')
+    .send('Bad Request: Invalid verification query');
 });
 
 // Support HEAD requests cleanly
-app.head(WEBHOOK_PATHS, (req, res) => {
+app.head(WEBHOOK_PATHS, (_req, res) => {
   res.status(200).set('Content-Type', 'text/plain; charset=utf-8').end();
 });
 
 // Meta Webhook Inbound Events (POST)
-app.post(WEBHOOK_PATHS, (req: any, res) => {
+// 1. Validates X-Hub-Signature-256 with correct candidate App Secret (BYOA or Platform)
+// 2. Acknowledges promptly with HTTP 200 text/plain
+// 3. Dispatches multi-tenant processing asynchronously with idempotency
+app.post(WEBHOOK_PATHS, async (req: any, res) => {
   try {
     const body = req.body;
-    console.log('[Meta Webhook POST event received]', { object: body?.object });
+    const rawBody = req.rawBody;
+    const hubSignature = req.headers['x-hub-signature-256'] as string | undefined;
 
-    // Optional HMAC-SHA256 signature verification (WhatsJet pattern)
-    const hubSignature = req.headers['x-hub-signature-256'] as string;
-    if (hubSignature && configuredAppSecret) {
-      try {
-        const parts = hubSignature.split('sha256=');
-        const hash = parts[1];
-        if (hash) {
-          const expected = crypto
-            .createHmac('sha256', configuredAppSecret)
-            .update(req.rawBody || JSON.stringify(req.body))
-            .digest('hex');
-          if (hash === expected) {
-            console.log('[Meta Webhook Signature] Authentic Meta SHA-256 payload verified.');
-          } else {
-            console.warn('[Meta Webhook Signature] Warning: SHA-256 signature did not match App Secret.');
-          }
-        }
-      } catch (err) {
-        console.warn('[Meta Webhook Signature] Verification check encountered error:', err);
-      }
-    }
+    // Extract WABA ID & Phone Number ID from incoming payload
+    const firstEntry = body?.entry?.[0];
+    const wabaId = firstEntry?.id;
+    const firstChange = firstEntry?.changes?.[0];
+    const phoneNumberId = firstChange?.value?.metadata?.phone_number_id;
 
-    if (body?.object === 'whatsapp_business_account') {
-      // Multi-tenant database routing & isolated tenant SSE broadcast
-      processInboundWebhookPayload(body).catch((routingErr) => {
-        console.error('[MultiTenant Webhook Routing Error]:', routingErr);
+    // Verify HMAC-SHA256 signature using appropriate tenant or platform secret
+    const sigCheck = await verifyMetaHubSignature({
+      rawBody,
+      hubSignatureHeader: hubSignature,
+      wabaId,
+      phoneNumberId
+    });
+
+    if (sigCheck.required && !sigCheck.isValid) {
+      console.warn(`[Meta Webhook POST] Signature rejected: ${sigCheck.reason}`);
+      await logWebhookEvent({
+        tenantId: null,
+        eventType: 'signature_failed',
+        payload: { reason: sigCheck.reason, wabaId, phoneNumberId },
+        isError: true
       });
+      return res
+        .status(401)
+        .set('Content-Type', 'text/plain; charset=utf-8')
+        .send('Unauthorized: Invalid Signature');
+    }
 
-      const entries = body.entry || [];
-      for (const entry of entries) {
-        const changes = entry.changes || [];
-        for (const change of changes) {
-          const value = change.value;
-          if (value) {
-            // New Inbound Messages
-            if (value.messages) {
-              for (const msg of value.messages) {
-                const contact = (value.contacts && value.contacts[0]) || null;
-                const ev: WebhookEvent = {
-                  id: msg.id || `${Date.now()}_${Math.random()}`,
-                  type: 'message',
-                  timestamp: parseInt(msg.timestamp || '0', 10) * 1000 || Date.now(),
-                  data: {
-                    ...msg,
-                    contactName: contact?.profile?.name || msg.from,
-                    phoneNumberId: value.metadata?.phone_number_id
+    // Acknowledge valid webhook receipt to Meta immediately
+    res.status(200).set('Content-Type', 'text/plain; charset=utf-8').send('EVENT_RECEIVED');
+
+    // Run expensive database and SSE operations asynchronously
+    setImmediate(async () => {
+      try {
+        if (body?.object === 'whatsapp_business_account') {
+          // Multi-tenant database routing & isolated tenant SSE push
+          await processInboundWebhookPayload(body);
+
+          const entries = body.entry || [];
+          for (const entry of entries) {
+            const changes = entry.changes || [];
+            for (const change of changes) {
+              const value = change.value;
+              if (value) {
+                // New Inbound Messages
+                if (value.messages) {
+                  for (const msg of value.messages) {
+                    const contact = (value.contacts && value.contacts[0]) || null;
+                    const ev: WebhookEvent = {
+                      id: msg.id || `${Date.now()}_${Math.random()}`,
+                      type: 'message',
+                      timestamp: parseInt(msg.timestamp || '0', 10) * 1000 || Date.now(),
+                      data: {
+                        ...msg,
+                        contactName: contact?.profile?.name || msg.from,
+                        phoneNumberId: value.metadata?.phone_number_id
+                      }
+                    };
+                    recentEvents.unshift(ev);
+                    broadcastSseEvent(ev);
                   }
-                };
-                recentEvents.unshift(ev);
-                broadcastSseEvent(ev);
-              }
-            }
-            // Message Status Updates (sent, delivered, read, failed)
-            if (value.statuses) {
-              for (const status of value.statuses) {
-                const ev: WebhookEvent = {
-                  id: status.id || `${Date.now()}_${Math.random()}`,
-                  type: 'status',
-                  timestamp: parseInt(status.timestamp || '0', 10) * 1000 || Date.now(),
-                  data: status
-                };
-                recentEvents.unshift(ev);
-                broadcastSseEvent(ev);
+                }
+                // Message Status Updates
+                if (value.statuses) {
+                  for (const status of value.statuses) {
+                    const ev: WebhookEvent = {
+                      id: status.id || `${Date.now()}_${Math.random()}`,
+                      type: 'status',
+                      timestamp: parseInt(status.timestamp || '0', 10) * 1000 || Date.now(),
+                      data: status
+                    };
+                    recentEvents.unshift(ev);
+                    broadcastSseEvent(ev);
+                  }
+                }
               }
             }
           }
+
+          if (recentEvents.length > 200) {
+            recentEvents.length = 200;
+          }
+          saveSavedEvents(recentEvents);
         }
+      } catch (asyncErr) {
+        console.error('[Async Inbound Webhook Error]:', asyncErr);
+        await logWebhookEvent({
+          tenantId: null,
+          eventType: 'async_inbound_error',
+          payload: { error: String(asyncErr) },
+          isError: true
+        });
       }
-
-      // Keep recent events buffer trimmed to last 200
-      if (recentEvents.length > 200) {
-        recentEvents.length = 200;
-      }
-      saveSavedEvents(recentEvents);
-
-      return res.status(200).set('Content-Type', 'text/plain; charset=utf-8').send('EVENT_RECEIVED');
-    }
-
-    return res.status(200).set('Content-Type', 'text/plain; charset=utf-8').send('OK');
+    });
   } catch (e) {
     console.error('Webhook error:', e);
-    return res.status(200).set('Content-Type', 'text/plain; charset=utf-8').send('ERROR_HANDLED');
+    if (!res.headersSent) {
+      return res.status(200).set('Content-Type', 'text/plain; charset=utf-8').send('ERROR_HANDLED');
+    }
   }
 });
 
@@ -745,12 +696,10 @@ app.post('/api/whatsapp/auto-setup', async (req, res) => {
     // Cache App Secret for payload signature checks
     configuredAppSecret = cleanAppSecret;
 
-    const effectiveVerifyToken = String(verifyToken || process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token').trim();
+    const effectiveVerifyToken = String(verifyToken || getPrimaryVerifyToken()).trim();
     const effectivePublicUrl = webhookUrl 
       ? String(webhookUrl).trim() 
-      : (publicTunnelUrl 
-          ? `${publicTunnelUrl}/api/whatsapp/webhook` 
-          : `https://ais-dev-zqx43entfejspel3jgqapu-10246562354.asia-southeast1.run.app/api/whatsapp/webhook`);
+      : getWhatsAppWebhookUrl();
 
     const resultLog: Array<{ step: string; status: 'success' | 'failed' | 'warning'; message: string; details?: any }> = [];
 
@@ -922,8 +871,8 @@ app.post('/api/whatsapp/save-credentials', async (req, res) => {
     if (creds.accessToken) lastKnownToken = creds.accessToken;
     if (creds.appSecret) configuredAppSecret = creds.appSecret;
 
-    if (publicTunnelUrl && creds.appId && creds.appSecret && creds.wabaId && creds.accessToken) {
-      autoRegisterWebhookWithMeta(creds, `${publicTunnelUrl}/api/whatsapp/webhook`).catch(() => {});
+    if (creds.appId && creds.appSecret && creds.wabaId && creds.accessToken) {
+      autoRegisterWebhookWithMeta(creds, getWhatsAppWebhookUrl()).catch(() => {});
     }
 
     return res.json({ success: true, message: 'Credentials saved on server' });
@@ -1031,87 +980,81 @@ app.get('/api/whatsapp/live-events', (req, res) => {
   });
 });
 
-// Endpoint providing the live Meta-accessible public webhook URL to frontend
-app.get('/api/whatsapp/public-webhook-info', (req, res) => {
-  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token';
-  const effectivePublicUrl = publicTunnelUrl || (process.env.APP_URL && !process.env.APP_URL.includes('ais-dev-') ? process.env.APP_URL : null);
+// Endpoint providing permanent Meta-accessible production webhook configuration & metrics
+app.get('/api/whatsapp/public-webhook-info', async (_req, res) => {
+  const webhookUrl = getWhatsAppWebhookUrl();
+  const verifyToken = getPrimaryVerifyToken();
+  const metrics = getWebhookMetrics();
 
   res.json({
     success: true,
-    tunnelActive: Boolean(publicTunnelUrl),
-    tunnelUrl: publicTunnelUrl,
-    directDevUrl: process.env.APP_URL || `http://localhost:${PORT}`,
-    recommendedWebhookUrl: publicTunnelUrl 
-      ? `${publicTunnelUrl}/api/whatsapp/webhook` 
-      : effectivePublicUrl
-        ? `${effectivePublicUrl}/api/whatsapp/webhook`
-        : `https://ais-dev-zqx43entfejspel3jgqapu-10246562354.asia-southeast1.run.app/api/whatsapp/webhook`,
-    verifyToken
+    baseUrl: getAppBaseUrl(),
+    webhookPath: getWhatsAppWebhookPath(),
+    recommendedWebhookUrl: webhookUrl,
+    verifyToken,
+    isHttps: webhookUrl.startsWith('https://'),
+    isPermanentDomain: true,
+    metrics
   });
 });
 
-// Endpoint to restart or refresh the public tunnel on demand
-app.post('/api/whatsapp/restart-tunnel', (req, res) => {
+// Endpoint for app UI to test Meta GET verification probe directly against the permanent endpoint
+app.post('/api/whatsapp/test-webhook', async (req, res) => {
   try {
-    console.log('[Tunnel] User requested manual tunnel restart...');
-    startPublicWebhookTunnel(PORT);
-    return res.json({ success: true, message: 'Tunnel restart initiated' });
+    const probe = await testWebhookVerificationProbe(req.body.url, req.body.verifyToken);
+    return res.json({
+      success: probe.success,
+      status: probe.httpStatus,
+      receivedBody: probe.receivedBody,
+      expectedChallenge: probe.expectedChallenge,
+      targetUrl: probe.targetUrl,
+      contentType: probe.contentType,
+      message: probe.message
+    });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || 'Failed to restart tunnel' });
+    console.error('[Webhook Verification Probe Error]:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Could not execute verification probe'
+    });
   }
 });
 
-// Endpoint for app UI to test if the public webhook or local webhook responds correctly to Meta verification
-app.post('/api/whatsapp/test-webhook', async (req, res) => {
-  const targetUrl = req.body.url || (publicTunnelUrl ? `${publicTunnelUrl}/api/whatsapp/webhook` : `http://localhost:${PORT}/api/whatsapp/webhook`);
-  const token = req.body.verifyToken || process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token';
-  const testChallenge = `challenge_${Math.random().toString(36).substring(2, 10)}`;
-
+// Endpoint for full 6-layer diagnostic inspection across credentials, WABA, Phone, Subscriptions, and Verification
+app.post('/api/whatsapp/diagnostics', async (req, res) => {
   try {
-    const probeUrl = new URL(targetUrl);
-    probeUrl.searchParams.set('hub.mode', 'subscribe');
-    probeUrl.searchParams.set('hub.challenge', testChallenge);
-    probeUrl.searchParams.set('hub.verify_token', token);
-
-    console.log(`[Webhook Self-Test] Probing ${probeUrl.toString()}...`);
-    const response = await fetch(probeUrl.toString(), {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'facebookplatform/1.0 (+http://developers.facebook.com)',
-        'Accept': '*/*'
-      }
+    const { token, phoneNumberId, wabaId, verifyToken } = req.body;
+    const report = await runFullDiagnostics({
+      token,
+      phoneNumberId,
+      wabaId,
+      verifyToken
     });
-
-    const bodyText = await response.text();
-    const isSuccess = response.status === 200 && bodyText.trim() === testChallenge;
-
-    return res.json({
-      success: isSuccess,
-      status: response.status,
-      receivedBody: bodyText.slice(0, 100),
-      expectedChallenge: testChallenge,
-      targetUrl: probeUrl.toString(),
-      message: isSuccess
-        ? 'Webhook is fully working and verified! Meta will accept it.'
-        : response.status === 302
-        ? 'HTTP 302: Authentication redirect detected. Use the Live Public Tunnel URL instead of the internal dev URL.'
-        : response.status === 403
-        ? 'HTTP 403: Verify Token mismatch. Ensure you type the same token in Meta.'
-        : `Unexpected response status HTTP ${response.status} from endpoint.`
-    });
+    return res.json({ success: true, report });
   } catch (err: any) {
-    console.error('[Webhook Self-Test Error]:', err);
+    console.error('[WhatsApp Diagnostics Error]:', err);
     return res.status(500).json({
       success: false,
-      error: err?.message || 'Could not reach webhook endpoint'
+      error: err?.message || 'Failed to complete diagnostic report'
     });
   }
+});
+
+// Endpoint to retrieve live webhook telemetry stats
+app.get('/api/whatsapp/webhook-stats', (_req, res) => {
+  res.json({
+    success: true,
+    metrics: getWebhookMetrics()
+  });
 });
 
 // Start dev server with Vite middlewares or static files
 async function startServer() {
   // Initialize PostgreSQL Database schema & relations
   await initDatabase();
+
+  // Initialize Webhook Telemetry metrics from database
+  await initializeWebhookMetrics();
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -1130,8 +1073,8 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`WhatsCloud server running on http://0.0.0.0:${PORT}`);
-    // Start public tunnel in background to bypass dev session cookie protection
-    startPublicWebhookTunnel(PORT);
+    console.log(`>>> Permanent Production WhatsApp Webhook: ${getWhatsAppWebhookUrl()}`);
+    console.log(`>>> Webhook Verify Token: ${getPrimaryVerifyToken()}`);
   });
 }
 

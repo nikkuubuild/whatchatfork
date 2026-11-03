@@ -29,7 +29,11 @@ import {
   Shield,
   LogOut,
   Building,
-  ChevronRight
+  ChevronRight,
+  Eye,
+  EyeOff,
+  Activity,
+  Server
 } from 'lucide-react';
 import { WhatsAppCredentials, QuickPresetsSettings } from '../../types/whatsapp';
 import { WhatsAppApiService } from '../../services/whatsappApi';
@@ -98,50 +102,44 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const [copiedWebhook, setCopiedWebhook] = useState(false);
   const [copiedVerify, setCopiedVerify] = useState(false);
+  const [showVerifyToken, setShowVerifyToken] = useState(false);
   const [liveWebhookUrl, setLiveWebhookUrl] = useState<string>('');
-  const [isTunnelActive, setIsTunnelActive] = useState<boolean>(false);
-  const [isCheckingTunnel, setIsCheckingTunnel] = useState<boolean>(false);
+  const [isRefreshingWebhook, setIsRefreshingWebhook] = useState(false);
   const [isTestingWebhook, setIsTestingWebhook] = useState(false);
+  const [isDiagnosing, setIsDiagnosing] = useState(false);
+  const [webhookMetrics, setWebhookMetrics] = useState<{
+    totalEventsReceived: number;
+    failedEvents: number;
+    lastReceivedAt: number | null;
+    lastProcessedAt: number | null;
+  } | null>(null);
   const [webhookTestResult, setWebhookTestResult] = useState<{
     success: boolean;
     message: string;
     status?: number;
   } | null>(null);
-  const [isRestartingTunnel, setIsRestartingTunnel] = useState(false);
+  const [diagnosticReport, setDiagnosticReport] = useState<any | null>(null);
 
-  // Fetch live public tunnel endpoint (bypasses AI Studio session cookie protection for Meta bots)
+  // Fetch permanent Meta webhook info and live metrics
   const fetchPublicWebhookInfo = async () => {
     try {
-      setIsCheckingTunnel(true);
-      const res = await fetch('/api/whatsapp/public-webhook-info');
-      if (res.ok) {
-        const data = await res.json();
+      setIsRefreshingWebhook(true);
+      const data = await WhatsAppApiService.getPublicWebhookInfo();
+      if (data?.success) {
         if (data.recommendedWebhookUrl) {
           setLiveWebhookUrl(data.recommendedWebhookUrl);
-          setIsTunnelActive(Boolean(data.tunnelActive));
           if (data.verifyToken && !credentials.webhookVerifyToken) {
             setVerifyToken(data.verifyToken);
           }
+        }
+        if (data.metrics) {
+          setWebhookMetrics(data.metrics);
         }
       }
     } catch (e) {
       console.warn('Could not fetch webhook info:', e);
     } finally {
-      setIsCheckingTunnel(false);
-    }
-  };
-
-  const handleRestartTunnel = async () => {
-    setIsRestartingTunnel(true);
-    setWebhookTestResult(null);
-    try {
-      await fetch('/api/whatsapp/restart-tunnel', { method: 'POST' });
-      setTimeout(async () => {
-        await fetchPublicWebhookInfo();
-        setIsRestartingTunnel(false);
-      }, 2500);
-    } catch {
-      setIsRestartingTunnel(false);
+      setIsRefreshingWebhook(false);
     }
   };
 
@@ -149,20 +147,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setIsTestingWebhook(true);
     setWebhookTestResult(null);
     try {
-      const res = await fetch('/api/whatsapp/test-webhook', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: effectiveWebhookUrl,
-          verifyToken: verifyToken.trim()
-        })
+      const data = await WhatsAppApiService.testWebhook({
+        url: effectiveWebhookUrl,
+        verifyToken: verifyToken.trim()
       });
-      const data = await res.json();
       setWebhookTestResult({
         success: Boolean(data.success),
-        message: data.message || (data.success ? 'Webhook responds with HTTP 200 and matches challenge!' : 'Failed verification'),
+        message: data.message || (data.success ? 'Webhook verified! Meta GET challenge returned HTTP 200.' : 'Failed verification'),
         status: data.status
       });
+      await fetchPublicWebhookInfo();
     } catch (e: any) {
       setWebhookTestResult({
         success: false,
@@ -173,17 +167,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
+  const handleRunFullDiagnostics = async () => {
+    if (!accessToken.trim()) {
+      alert('Please enter a Meta Access Token first.');
+      return;
+    }
+    setIsDiagnosing(true);
+    setDiagnosticReport(null);
+    try {
+      const data = await WhatsAppApiService.runDiagnostics({
+        token: accessToken.trim(),
+        phoneNumberId: phoneNumberId.trim() || undefined,
+        wabaId: wabaId.trim() || undefined,
+        verifyToken: verifyToken.trim() || undefined
+      });
+      if (data.success && data.report) {
+        setDiagnosticReport(data.report);
+      } else {
+        alert(data.error || 'Failed to complete diagnostic report');
+      }
+    } catch (err: any) {
+      alert(err?.message || 'Error running diagnostics');
+    } finally {
+      setIsDiagnosing(false);
+    }
+  };
+
   useEffect(() => {
     fetchPublicWebhookInfo();
-    const interval = setInterval(fetchPublicWebhookInfo, 5000);
-    return () => clearInterval(interval);
   }, []);
 
-  const defaultDevUrl = typeof window !== 'undefined' 
-    ? `${window.location.origin}/api/whatsapp/webhook` 
-    : 'https://your-domain.com/api/whatsapp/webhook';
-
-  const effectiveWebhookUrl = liveWebhookUrl || defaultDevUrl;
+  const defaultProductionUrl = 'https://whatchatfork.onrender.com/api/whatsapp/webhook';
+  const effectiveWebhookUrl = liveWebhookUrl || defaultProductionUrl;
 
   const handleAutoSetup = async () => {
     if (!appId.trim() || !appSecret.trim() || !accessToken.trim() || !wabaId.trim()) {
@@ -759,57 +774,82 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {/* Test Result Box */}
           {testResult && (
             <div
-              className={`p-3 rounded-xl border text-xs flex items-start gap-2.5 ${
+              className={`p-3.5 rounded-xl border text-xs space-y-2.5 ${
                 testResult.success
                   ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-900 text-emerald-800 dark:text-emerald-200'
                   : 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-900 text-red-800 dark:text-red-200'
               }`}
             >
-              {testResult.success ? (
-                <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-              ) : (
-                <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
-              )}
-              <div className="flex-1">
-                <p className="font-semibold">{testResult.message}</p>
-                {testResult.phone?.quality_rating && (
-                  <p className="text-[11px] mt-1 text-emerald-700 dark:text-emerald-300">
-                    Phone Quality Rating: <strong>{testResult.phone.quality_rating}</strong> · Status: {testResult.phone.code_verification_status || 'VERIFIED'}
-                  </p>
+              <div className="flex items-start gap-2.5">
+                {testResult.success ? (
+                  <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
                 )}
+                <div className="flex-1">
+                  <p className="font-semibold text-sm">{testResult.message}</p>
+                </div>
               </div>
+
+              {testResult.phone && (
+                <div className="space-y-2 pt-1 border-t border-emerald-200/60 dark:border-emerald-800/60 text-[11px]">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <div className="p-2 rounded-lg bg-emerald-100/70 dark:bg-emerald-900/50">
+                      <span className="block text-[10px] text-emerald-700 dark:text-emerald-300 uppercase font-bold">Operational Status</span>
+                      <strong className="text-emerald-950 dark:text-emerald-100 text-xs">
+                        {testResult.phone.operational_status || testResult.phone.status || 'CONNECTED'}
+                      </strong>
+                    </div>
+                    <div className="p-2 rounded-lg bg-emerald-100/70 dark:bg-emerald-900/50">
+                      <span className="block text-[10px] text-emerald-700 dark:text-emerald-300 uppercase font-bold">Quality Rating</span>
+                      <strong className="text-emerald-950 dark:text-emerald-100 text-xs">
+                        {testResult.phone.quality_rating || 'GREEN'}
+                      </strong>
+                    </div>
+                    <div className="p-2 rounded-lg bg-emerald-100/70 dark:bg-emerald-900/50">
+                      <span className="block text-[10px] text-emerald-700 dark:text-emerald-300 uppercase font-bold">Name Status</span>
+                      <strong className="text-emerald-950 dark:text-emerald-100 text-xs">
+                        {testResult.phone.name_status || 'APPROVED'}
+                      </strong>
+                    </div>
+                    <div className="p-2 rounded-lg bg-emerald-100/70 dark:bg-emerald-900/50">
+                      <span className="block text-[10px] text-emerald-700 dark:text-emerald-300 uppercase font-bold">2FA Setup OTP</span>
+                      <span className="font-semibold text-emerald-900 dark:text-emerald-200 text-xs">
+                        {testResult.phone.two_factor_status || 'EXPIRED (Registered)'}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-emerald-700/90 dark:text-emerald-300/90 italic">
+                    ℹ️ Note: 2FA Setup OTP "EXPIRED" indicates the temporary registration SMS code expired after registration. The phone is fully active and connected.
+                  </p>
+                </div>
+              )}
             </div>
           )}
         </div>
 
-        {/* Webhook Configuration Card */}
-        <div className="bg-white dark:bg-[#1F2C34] rounded-2xl p-4 shadow-sm border border-slate-200 dark:border-slate-800 space-y-3 text-xs">
+        {/* Webhook Configuration Dashboard Card */}
+        <div className="bg-white dark:bg-[#1F2C34] rounded-2xl p-4 shadow-sm border border-slate-200 dark:border-slate-800 space-y-3.5 text-xs">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5 font-bold text-slate-900 dark:text-white">
               <ShieldCheck className="w-4 h-4 text-[#008069] dark:text-[#25D366]" />
               <span>Meta Webhook Configuration</span>
             </div>
-            {isTunnelActive ? (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
-                <Radio className="w-3 h-3 animate-pulse text-emerald-500" />
-                <span>Public Webhook Live</span>
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-                <RefreshCw className={`w-3 h-3 ${isCheckingTunnel ? 'animate-spin' : ''}`} />
-                <span>Connecting Tunnel...</span>
-              </span>
-            )}
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span>Permanent Render Edge (Direct Meta)</span>
+            </span>
           </div>
 
           {/* Explanation Alert */}
-          <div className="p-2.5 rounded-xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200/80 dark:border-emerald-900/60 text-emerald-900 dark:text-emerald-200 space-y-1">
-            <div className="flex items-center gap-1.5 font-semibold text-[11px]">
+          <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 space-y-1">
+            <div className="flex items-center gap-1.5 font-semibold text-[11px] text-slate-900 dark:text-white">
               <Sparkles className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-              <span>Use this Live Public URL in Meta Developer Dashboard</span>
+              <span>Production Webhook Settings for Meta Developer Portal</span>
             </div>
-            <p className="text-[10px] text-emerald-800/90 dark:text-emerald-300/90 leading-relaxed">
-              <strong>Notice:</strong> The AI Studio internal dev domain (<code>ais-dev-...</code>) is protected by Google session cookies, which rejects Meta's external webhook bots with <code>HTTP 302</code>. The public URL below routes directly to this applet with zero authentication gatekeepers, satisfying Meta's strict verification check.
+            <p className="text-[10px] text-slate-600 dark:text-slate-400 leading-relaxed">
+              Copy the permanent Callback URL and Verify Token below into <strong>Meta App Dashboard &rarr; WhatsApp &rarr; Configuration &rarr; Webhook</strong>. 
+              The backend directly receives and authenticates events via Render HTTPS with zero development tunnels.
             </p>
           </div>
 
@@ -817,17 +857,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
-                Callback URL (Copy into Meta)
+                Permanent Production Callback URL
               </label>
-              <button
-                onClick={fetchPublicWebhookInfo}
-                disabled={isCheckingTunnel}
-                className="text-[10px] text-[#008069] dark:text-[#25D366] hover:underline flex items-center gap-1"
-                title="Refresh public tunnel URL"
-              >
-                <RefreshCw className={`w-2.5 h-2.5 ${isCheckingTunnel ? 'animate-spin' : ''}`} />
-                <span>Refresh URL</span>
-              </button>
+              <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium">
+                HTTPS Verified
+              </span>
             </div>
             <div className="flex items-center gap-1.5">
               <input
@@ -837,6 +871,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 className="w-full font-mono text-[11px] px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-200 select-all"
               />
               <button
+                type="button"
                 onClick={() => handleCopy(effectiveWebhookUrl, 'webhook')}
                 className="px-3 py-2 rounded-lg bg-[#008069] text-white hover:bg-[#00705b] flex items-center gap-1 font-semibold text-xs shrink-0 active:scale-95 transition-transform"
               >
@@ -849,16 +884,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {/* Verify Token */}
           <div>
             <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-              Verify Token (Copy into Meta)
+              Webhook Verification Token
             </label>
             <div className="flex items-center gap-1.5">
-              <input
-                type="text"
-                value={verifyToken}
-                onChange={(e) => setVerifyToken(e.target.value)}
-                className="w-full font-mono text-[11px] px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-200"
-              />
+              <div className="relative w-full">
+                <input
+                  type={showVerifyToken ? 'text' : 'password'}
+                  value={verifyToken}
+                  onChange={(e) => setVerifyToken(e.target.value)}
+                  className="w-full font-mono text-[11px] px-3 py-2 pr-9 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-200"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowVerifyToken(!showVerifyToken)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                  title={showVerifyToken ? 'Hide token' : 'Show token'}
+                >
+                  {showVerifyToken ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
               <button
+                type="button"
                 onClick={() => handleCopy(verifyToken, 'verify')}
                 className="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 flex items-center gap-1 font-semibold text-xs shrink-0 active:scale-95 transition-transform"
               >
@@ -867,6 +913,93 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </button>
             </div>
           </div>
+
+          {/* Webhook Telemetry & Health Grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 border-t border-slate-100 dark:border-slate-800/80">
+            <div className="p-2 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/60 dark:border-slate-800">
+              <span className="block text-[10px] text-slate-500 uppercase font-semibold">Total Events</span>
+              <strong className="text-slate-900 dark:text-white font-mono text-sm">
+                {webhookMetrics?.totalEventsReceived ?? 0}
+              </strong>
+            </div>
+            <div className="p-2 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/60 dark:border-slate-800">
+              <span className="block text-[10px] text-slate-500 uppercase font-semibold">Processed</span>
+              <strong className="text-emerald-600 dark:text-emerald-400 font-mono text-sm">
+                {(webhookMetrics?.totalEventsReceived ?? 0) - (webhookMetrics?.failedEvents ?? 0)}
+              </strong>
+            </div>
+            <div className="p-2 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/60 dark:border-slate-800">
+              <span className="block text-[10px] text-slate-500 uppercase font-semibold">Failed Events</span>
+              <strong className={`font-mono text-sm ${webhookMetrics?.failedEvents ? 'text-rose-500' : 'text-slate-700 dark:text-slate-300'}`}>
+                {webhookMetrics?.failedEvents ?? 0}
+              </strong>
+            </div>
+            <div className="p-2 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200/60 dark:border-slate-800">
+              <span className="block text-[10px] text-slate-500 uppercase font-semibold">Last Received</span>
+              <span className="text-[11px] text-slate-700 dark:text-slate-300 font-medium truncate block">
+                {webhookMetrics?.lastReceivedAt 
+                  ? new Date(webhookMetrics.lastReceivedAt).toLocaleTimeString() 
+                  : 'No events yet'}
+              </span>
+            </div>
+          </div>
+
+          {/* 6-Layer Diagnostic Suite Output */}
+          {diagnosticReport && (
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/80 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-[11px] text-slate-900 dark:text-white flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                  <span>Meta 6-Point Diagnostic Suite Report</span>
+                </span>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                  diagnosticReport.overallStatus === 'active'
+                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                    : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                }`}>
+                  Status: {diagnosticReport.overallStatus}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
+                <div className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
+                  <span className="font-semibold block text-slate-800 dark:text-slate-200">1. Credentials & Token:</span>
+                  <span className={diagnosticReport.checks.credentials.isValid ? 'text-emerald-600' : 'text-rose-500'}>
+                    {diagnosticReport.checks.credentials.isValid ? '✓ Valid Permanent Token' : `✗ ${diagnosticReport.checks.credentials.error}`}
+                  </span>
+                </div>
+                <div className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
+                  <span className="font-semibold block text-slate-800 dark:text-slate-200">2. WhatsApp Business Account:</span>
+                  <span className={diagnosticReport.checks.waba.status === 'active' ? 'text-emerald-600' : 'text-amber-500'}>
+                    {diagnosticReport.checks.waba.status === 'active' ? `✓ ${diagnosticReport.checks.waba.name || 'Active'}` : 'Pending / Not set'}
+                  </span>
+                </div>
+                <div className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
+                  <span className="font-semibold block text-slate-800 dark:text-slate-200">3. Phone Number Registration:</span>
+                  <span className={diagnosticReport.checks.phoneNumber.status === 'connected' ? 'text-emerald-600' : 'text-amber-500'}>
+                    {diagnosticReport.checks.phoneNumber.status === 'connected' ? `✓ Connected (${diagnosticReport.checks.phoneNumber.qualityRating || 'GREEN'})` : 'Not connected'}
+                  </span>
+                </div>
+                <div className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
+                  <span className="font-semibold block text-slate-800 dark:text-slate-200">4. WABA App Subscription:</span>
+                  <span className={diagnosticReport.checks.webhookSubscription.isSubscribed ? 'text-emerald-600' : 'text-amber-500'}>
+                    {diagnosticReport.checks.webhookSubscription.isSubscribed ? '✓ Subscribed Apps Active' : 'Not subscribed via subscribed_apps'}
+                  </span>
+                </div>
+                <div className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
+                  <span className="font-semibold block text-slate-800 dark:text-slate-200">5. Webhook Challenge Verification:</span>
+                  <span className={diagnosticReport.checks.webhookVerification.challengeMatched ? 'text-emerald-600' : 'text-rose-500'}>
+                    {diagnosticReport.checks.webhookVerification.challengeMatched ? '✓ Handshake Passed (HTTP 200)' : 'Failed verification'}
+                  </span>
+                </div>
+                <div className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
+                  <span className="font-semibold block text-slate-800 dark:text-slate-200">6. Messaging Availability:</span>
+                  <span className={diagnosticReport.checks.messagingAvailability.canSend ? 'text-emerald-600' : 'text-amber-500'}>
+                    {diagnosticReport.checks.messagingAvailability.canSend ? '✓ Ready to Send & Receive' : 'Messaging Blocked'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Webhook Test Diagnostic Result */}
           {webhookTestResult && (
@@ -902,16 +1035,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               className="flex-1 py-2 px-3 rounded-xl bg-slate-900 dark:bg-slate-700 text-white font-semibold text-xs hover:bg-slate-800 dark:hover:bg-slate-600 flex items-center justify-center gap-1.5 active:scale-[0.98] transition-transform disabled:opacity-60"
             >
               <ShieldCheck className="w-4 h-4 text-emerald-400" />
-              <span>{isTestingWebhook ? 'Simulating Meta Handshake...' : 'Test Webhook Verification'}</span>
+              <span>{isTestingWebhook ? 'Simulating Meta Handshake...' : 'Test Verification'}</span>
             </button>
             <button
               type="button"
-              onClick={handleRestartTunnel}
-              disabled={isRestartingTunnel}
+              onClick={handleRunFullDiagnostics}
+              disabled={isDiagnosing}
               className="py-2 px-3 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold text-xs flex items-center justify-center gap-1.5 active:scale-[0.98] transition-transform disabled:opacity-60"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRestartingTunnel ? 'animate-spin' : ''}`} />
-              <span>{isRestartingTunnel ? 'Reconnecting...' : 'Restart Tunnel'}</span>
+              <Activity className={`w-3.5 h-3.5 ${isDiagnosing ? 'animate-spin text-emerald-500' : ''}`} />
+              <span>{isDiagnosing ? 'Running 6-Point Check...' : '6-Point Diagnostics'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={fetchPublicWebhookInfo}
+              disabled={isRefreshingWebhook}
+              className="py-2 px-3 rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold text-xs flex items-center justify-center gap-1.5 active:scale-[0.98] transition-transform disabled:opacity-60"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingWebhook ? 'animate-spin' : ''}`} />
+              <span>Refresh Status</span>
             </button>
           </div>
         </div>

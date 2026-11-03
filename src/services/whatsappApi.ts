@@ -213,5 +213,42 @@ export const WhatsAppApiService = {
       }
     });
     return await res.json();
+  },
+
+  // Fetch permanent Meta webhook configuration info and live telemetry
+  async getPublicWebhookInfo() {
+    const res = await fetch('/api/whatsapp/public-webhook-info');
+    return await res.json();
+  },
+
+  // Test Meta Webhook GET challenge verification
+  async testWebhook(payload?: { url?: string; verifyToken?: string }) {
+    const res = await fetch('/api/whatsapp/test-webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    });
+    return await res.json();
+  },
+
+  // Run comprehensive 6-layer diagnostic inspection
+  async runDiagnostics(params: {
+    token: string;
+    phoneNumberId?: string;
+    wabaId?: string;
+    verifyToken?: string;
+  }) {
+    const res = await fetch('/api/whatsapp/diagnostics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params)
+    });
+    return await res.json();
+  },
+
+  // Fetch live webhook telemetry metrics
+  async getWebhookStats() {
+    const res = await fetch('/api/whatsapp/webhook-stats');
+    return await res.json();
   }
 };

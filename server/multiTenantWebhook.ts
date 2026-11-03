@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { db } from './db.js';
 import { v4 as uuidv4 } from 'uuid';
+import { logWebhookEvent } from './webhookDiagnostics.js';
 
 // In-memory tenant-isolated SSE connections
 // Map<tenantId, Set<{ id: string; res: Response }>>
@@ -85,8 +86,8 @@ export async function resolveTenantFromWebhook(wabaId?: string, phoneNumberId?: 
     if (channel) return { tenantId: channel.tenant_id, channelId: channel.id };
   }
 
-  // Fallback to default demo tenant if single channel exists
-  const defaultChannel = (await db.prepare('SELECT id, tenant_id FROM whatsapp_channels LIMIT 1').get()) as {
+  // Fallback to active channel if only one exists
+  const defaultChannel = (await db.prepare("SELECT id, tenant_id FROM whatsapp_channels WHERE status = 'active' LIMIT 1").get()) as {
     id: string;
     tenant_id: string;
   } | undefined;
@@ -116,6 +117,12 @@ export async function processInboundWebhookPayload(body: any): Promise<void> {
 
       if (!tenantMatch) {
         console.warn(`[Webhook Router] Unmapped inbound event for WABA ${wabaId} / Phone ${phoneNumberId}. Skipping.`);
+        await logWebhookEvent({
+          tenantId: null,
+          eventType: 'unmapped_event',
+          payload: { wabaId, phoneNumberId, change },
+          isError: true
+        });
         continue;
       }
 
@@ -124,114 +131,155 @@ export async function processInboundWebhookPayload(body: any): Promise<void> {
       // 1. Process Inbound Messages
       if (Array.isArray(value.messages)) {
         for (const msg of value.messages) {
-          const contact = (value.contacts && value.contacts[0]) || null;
-          const senderPhone = msg.from;
-          const senderName = contact?.profile?.name || senderPhone;
-          const msgTimestamp = parseInt(msg.timestamp || '0', 10) * 1000 || Date.now();
-          const msgId = msg.id || uuidv4();
+          try {
+            const contact = (value.contacts && value.contacts[0]) || null;
+            const senderPhone = msg.from;
+            const senderName = contact?.profile?.name || senderPhone;
+            const msgTimestamp = parseInt(msg.timestamp || '0', 10) * 1000 || Date.now();
+            const msgId = msg.id || uuidv4();
 
-          let textContent = '';
-          let mediaUrl: string | null = null;
-          let mediaCaption: string | null = null;
-          let filename: string | null = null;
-          let locationJson: string | null = null;
+            // Idempotency: skip if already processed
+            const existingMsg = (await db.prepare('SELECT id FROM messages WHERE meta_message_id = ?').get(msgId)) as { id: string } | undefined;
+            if (existingMsg) {
+              console.log(`[Webhook Idempotency] Message ${msgId} already processed. Skipping duplicate.`);
+              continue;
+            }
 
-          if (msg.type === 'text') {
-            textContent = msg.text?.body || '';
-          } else if (msg.type === 'image') {
-            textContent = msg.image?.caption || 'Photo';
-            mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.image?.id || '')}`;
-            mediaCaption = msg.image?.caption || null;
-          } else if (msg.type === 'video') {
-            textContent = msg.video?.caption || 'Video';
-            mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.video?.id || '')}`;
-          } else if (msg.type === 'audio') {
-            textContent = 'Voice message';
-            mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.audio?.id || '')}`;
-          } else if (msg.type === 'document') {
-            textContent = msg.document?.filename || 'Document';
-            filename = msg.document?.filename || null;
-            mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.document?.id || '')}`;
-          } else if (msg.type === 'location') {
-            textContent = msg.location?.name || 'Shared Location';
-            locationJson = JSON.stringify(msg.location);
-          } else if (msg.type === 'button') {
-            textContent = msg.button?.text || '';
-          } else if (msg.type === 'interactive') {
-            textContent = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || 'Interactive response';
-          } else {
-            textContent = `[${msg.type} message]`;
-          }
+            let textContent = '';
+            let mediaUrl: string | null = null;
+            let mediaCaption: string | null = null;
+            let filename: string | null = null;
+            let locationJson: string | null = null;
 
-          // Atomically upsert conversation
-          let conv = (await db.prepare('SELECT id, unread_count FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, senderPhone)) as {
-            id: string;
-            unread_count: number;
-          } | undefined;
+            if (msg.type === 'text') {
+              textContent = msg.text?.body || '';
+            } else if (msg.type === 'image') {
+              textContent = msg.image?.caption || 'Photo';
+              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.image?.id || '')}`;
+              mediaCaption = msg.image?.caption || null;
+            } else if (msg.type === 'video') {
+              textContent = msg.video?.caption || 'Video';
+              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.video?.id || '')}`;
+            } else if (msg.type === 'audio') {
+              textContent = 'Voice message';
+              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.audio?.id || '')}`;
+            } else if (msg.type === 'document') {
+              textContent = msg.document?.filename || 'Document';
+              filename = msg.document?.filename || null;
+              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.document?.id || '')}`;
+            } else if (msg.type === 'location') {
+              textContent = msg.location?.name || 'Shared Location';
+              locationJson = JSON.stringify(msg.location);
+            } else if (msg.type === 'button') {
+              textContent = msg.button?.text || '';
+            } else if (msg.type === 'interactive') {
+              textContent = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || 'Interactive response';
+            } else {
+              textContent = `[${msg.type} message]`;
+            }
 
-          let convId = conv ? conv.id : uuidv4();
-          if (conv) {
-            await db.prepare(`
-              UPDATE conversations
-              SET customer_name = COALESCE(?, customer_name),
-                  unread_count = unread_count + 1,
-                  last_message_preview = ?,
-                  updated_at = ?
-              WHERE id = ?
-            `).run(senderName, textContent, msgTimestamp, convId);
-          } else {
-            const colors = ['#008069', '#128C7E', '#25D366', '#075E54', '#34B7F1'];
-            const randomColor = colors[Math.floor(Math.random() * colors.length)];
-            await db.prepare(`
-              INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-            `).run(convId, tenantId, channelId, senderPhone, senderName, randomColor, textContent, msgTimestamp, msgTimestamp);
-          }
+            // Atomically upsert conversation
+            let conv = (await db.prepare('SELECT id, unread_count FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, senderPhone)) as {
+              id: string;
+              unread_count: number;
+            } | undefined;
 
-          // Insert Message
-          const existingMsg = await db.prepare('SELECT id FROM messages WHERE meta_message_id = ?').get(msgId);
-          if (!existingMsg) {
+            let convId = conv ? conv.id : uuidv4();
+            if (conv) {
+              await db.prepare(`
+                UPDATE conversations
+                SET customer_name = COALESCE(?, customer_name),
+                    unread_count = unread_count + 1,
+                    last_message_preview = ?,
+                    updated_at = ?
+                WHERE id = ?
+              `).run(senderName, textContent, msgTimestamp, convId);
+            } else {
+              const colors = ['#008069', '#128C7E', '#25D366', '#075E54', '#34B7F1'];
+              const randomColor = colors[Math.floor(Math.random() * colors.length)];
+              await db.prepare(`
+                INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+              `).run(convId, tenantId, channelId, senderPhone, senderName, randomColor, textContent, msgTimestamp, msgTimestamp);
+            }
+
+            // Insert Message
             await db.prepare(`
               INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, location_json, status, created_at)
               VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'read', ?)
             `).run(uuidv4(), tenantId, convId, msgId, msg.type, textContent, mediaUrl, mediaCaption, filename, locationJson, msgTimestamp);
-          }
 
-          // Broadcast isolated SSE event to this tenant
-          broadcastTenantEvent(tenantId, {
-            id: msgId,
-            type: 'message',
-            timestamp: msgTimestamp,
-            data: {
-              ...msg,
-              contactName: senderName,
-              phoneNumberId
-            }
-          });
+            // Log event into audit trail
+            await logWebhookEvent({
+              tenantId,
+              eventType: 'inbound_message',
+              payload: { msgId, from: senderPhone, type: msg.type }
+            });
+
+            // Broadcast isolated SSE event to this tenant
+            broadcastTenantEvent(tenantId, {
+              id: msgId,
+              type: 'message',
+              timestamp: msgTimestamp,
+              data: {
+                ...msg,
+                contactName: senderName,
+                phoneNumberId
+              }
+            });
+          } catch (msgErr) {
+            console.error('[Inbound Message Processing Error]:', msgErr);
+            await logWebhookEvent({
+              tenantId,
+              eventType: 'message_processing_error',
+              payload: { error: String(msgErr), msg },
+              isError: true
+            });
+          }
         }
       }
 
       // 2. Process Status Updates (sent, delivered, read, failed)
       if (Array.isArray(value.statuses)) {
         for (const status of value.statuses) {
-          const metaMsgId = status.id;
-          const statusValue = status.status;
-          const statusTimestamp = parseInt(status.timestamp || '0', 10) * 1000 || Date.now();
+          try {
+            const metaMsgId = status.id;
+            const statusValue = status.status;
+            const statusTimestamp = parseInt(status.timestamp || '0', 10) * 1000 || Date.now();
 
-          // Update message status in DB
-          await db.prepare(`
-            UPDATE messages
-            SET status = ?
-            WHERE meta_message_id = ? AND tenant_id = ?
-          `).run(statusValue, metaMsgId, tenantId);
+            // Safe update: do not downgrade read status
+            await db.prepare(`
+              UPDATE messages
+              SET status = CASE 
+                WHEN status = 'read' AND ? IN ('sent', 'delivered') THEN status
+                ELSE ?
+              END
+              WHERE meta_message_id = ? AND tenant_id = ?
+            `).run(statusValue, statusValue, metaMsgId, tenantId);
 
-          // Broadcast isolated status event to this tenant
-          broadcastTenantEvent(tenantId, {
-            id: metaMsgId,
-            type: 'status',
-            timestamp: statusTimestamp,
-            data: status
-          });
+            // Log status update
+            await logWebhookEvent({
+              tenantId,
+              eventType: `status_${statusValue}`,
+              payload: { metaMsgId, status: statusValue }
+            });
+
+            // Broadcast isolated status event to this tenant
+            broadcastTenantEvent(tenantId, {
+              id: metaMsgId,
+              type: 'status',
+              timestamp: statusTimestamp,
+              data: status
+            });
+          } catch (statusErr) {
+            console.error('[Status Update Processing Error]:', statusErr);
+            await logWebhookEvent({
+              tenantId,
+              eventType: 'status_processing_error',
+              payload: { error: String(statusErr), status },
+              isError: true
+            });
+          }
         }
       }
     }
