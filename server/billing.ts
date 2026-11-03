@@ -11,23 +11,23 @@ export interface BillingConfig {
   companyAddress: string;
 }
 
-export function getBillingConfig(): BillingConfig {
-  const getVal = (key: string, fallback: string = ''): string => {
-    const row = db.prepare('SELECT value FROM platform_config WHERE key = ?').get(key) as { value: string } | undefined;
+export async function getBillingConfig(): Promise<BillingConfig> {
+  const getVal = async (key: string, fallback: string = ''): Promise<string> => {
+    const row = (await db.prepare('SELECT value FROM platform_config WHERE key = ?').get(key)) as { value: string } | undefined;
     return row ? row.value : fallback;
   };
 
   return {
-    razorpayKeyId: getVal('razorpay_key_id', process.env.RAZORPAY_KEY_ID || 'rzp_test_mock_whatchat'),
-    razorpayKeySecret: getVal('razorpay_key_secret', process.env.RAZORPAY_KEY_SECRET || 'mock_secret_key_12345'),
-    companyName: getVal('company_legal_name', 'WhatChat Online Technologies Pvt Ltd'),
-    companyGstin: getVal('company_gstin', '27AABCW1234F1Z5'),
-    companyState: getVal('company_state', 'MH'),
-    companyAddress: getVal('company_address', 'Tech Park, Mumbai, Maharashtra - 400001')
+    razorpayKeyId: await getVal('razorpay_key_id', process.env.RAZORPAY_KEY_ID || 'rzp_test_mock_whatchat'),
+    razorpayKeySecret: await getVal('razorpay_key_secret', process.env.RAZORPAY_KEY_SECRET || 'mock_secret_key_12345'),
+    companyName: await getVal('company_legal_name', 'WhatChat Online Technologies Pvt Ltd'),
+    companyGstin: await getVal('company_gstin', '27AABCW1234F1Z5'),
+    companyState: await getVal('company_state', 'MH'),
+    companyAddress: await getVal('company_address', 'Tech Park, Mumbai, Maharashtra - 400001')
   };
 }
 
-export function saveBillingConfig(config: Partial<BillingConfig>) {
+export async function saveBillingConfig(config: Partial<BillingConfig>) {
   const now = Date.now();
   const upsert = db.prepare(`
     INSERT INTO platform_config (key, value, updated_at)
@@ -35,19 +35,17 @@ export function saveBillingConfig(config: Partial<BillingConfig>) {
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `);
 
-  if (config.razorpayKeyId !== undefined) upsert.run('razorpay_key_id', config.razorpayKeyId.trim(), now);
-  if (config.razorpayKeySecret !== undefined) upsert.run('razorpay_key_secret', config.razorpayKeySecret.trim(), now);
-  if (config.companyName !== undefined) upsert.run('company_legal_name', config.companyName.trim(), now);
-  if (config.companyGstin !== undefined) upsert.run('company_gstin', config.companyGstin.trim(), now);
-  if (config.companyState !== undefined) upsert.run('company_state', config.companyState.trim().toUpperCase(), now);
-  if (config.companyAddress !== undefined) upsert.run('company_address', config.companyAddress.trim(), now);
+  if (config.razorpayKeyId !== undefined) await upsert.run('razorpay_key_id', config.razorpayKeyId.trim(), now);
+  if (config.razorpayKeySecret !== undefined) await upsert.run('razorpay_key_secret', config.razorpayKeySecret.trim(), now);
+  if (config.companyName !== undefined) await upsert.run('company_legal_name', config.companyName.trim(), now);
+  if (config.companyGstin !== undefined) await upsert.run('company_gstin', config.companyGstin.trim(), now);
+  if (config.companyState !== undefined) await upsert.run('company_state', config.companyState.trim().toUpperCase(), now);
+  if (config.companyAddress !== undefined) await upsert.run('company_address', config.companyAddress.trim(), now);
 }
 
 // Calculate GST Tax Breakup (18% GST: CGST+SGST for intra-state, IGST for inter-state)
-export function calculateGstBreakup(subtotal: number, customerState?: string) {
-  const config = getBillingConfig();
-  const isIntraState = !customerState || customerState.trim().toUpperCase() === config.companyState.toUpperCase();
-
+export function calculateGstBreakup(subtotal: number, customerState?: string, companyState: string = 'MH') {
+  const isIntraState = !customerState || customerState.trim().toUpperCase() === companyState.toUpperCase();
   const totalGst = Math.round(subtotal * 0.18 * 100) / 100;
 
   if (isIntraState) {
@@ -79,17 +77,17 @@ export function calculateGstBreakup(subtotal: number, customerState?: string) {
 }
 
 // Generate Next Sequential GST Tax Invoice Number (INV-YYYY-XXXX)
-export function generateNextInvoiceNumber(): string {
+export async function generateNextInvoiceNumber(): Promise<string> {
   const currentYear = new Date().getFullYear();
-  const countRecord = db.prepare('SELECT count(*) as count FROM invoices').get() as { count: number | bigint };
+  const countRecord = (await db.prepare('SELECT count(*) as count FROM invoices').get()) as { count: number | bigint | string } | undefined;
   const nextNum = (Number(countRecord?.count || 0) + 1).toString().padStart(4, '0');
   return `INV-${currentYear}-${nextNum}`;
 }
 
 // Validate Coupon Code
-export function validateCoupon(code: string) {
+export async function validateCoupon(code: string) {
   const cleanCode = code.trim().toUpperCase();
-  const coupon = db.prepare('SELECT * FROM coupons WHERE code = ? AND is_active = 1').get(cleanCode) as any;
+  const coupon = (await db.prepare('SELECT * FROM coupons WHERE code = ? AND is_active = 1').get(cleanCode)) as any;
 
   if (!coupon) {
     return { valid: false, error: 'Invalid or expired coupon code' };
@@ -116,7 +114,7 @@ export async function createSubscriptionOrder(params: {
 }) {
   const { tenantId, planSlug, billingCycle, couponCode, customerState, customerGstin } = params;
 
-  const plan = db.prepare('SELECT * FROM plans WHERE slug = ?').get(planSlug) as any;
+  const plan = (await db.prepare('SELECT * FROM plans WHERE slug = ?').get(planSlug)) as any;
   if (!plan) {
     throw new Error('Selected plan not found');
   }
@@ -125,7 +123,7 @@ export async function createSubscriptionOrder(params: {
   let discountAmount = 0;
 
   if (couponCode) {
-    const couponRes = validateCoupon(couponCode);
+    const couponRes = await validateCoupon(couponCode);
     if (couponRes.valid) {
       if (couponRes.discountPercent) {
         discountAmount = Math.round((basePrice * couponRes.discountPercent) / 100);
@@ -135,9 +133,9 @@ export async function createSubscriptionOrder(params: {
     }
   }
 
+  const config = await getBillingConfig();
   const subtotal = Math.max(0, basePrice - discountAmount);
-  const tax = calculateGstBreakup(subtotal, customerState);
-  const config = getBillingConfig();
+  const tax = calculateGstBreakup(subtotal, customerState, config.companyState);
 
   // Generate order ID
   const orderId = `order_${uuidv4().replace(/-/g, '').substring(0, 14)}`;
@@ -222,8 +220,8 @@ export async function verifyAndActivateSubscription(params: {
     customerAddress
   } = params;
 
-  const config = getBillingConfig();
-  const plan = db.prepare('SELECT * FROM plans WHERE slug = ?').get(planSlug) as any;
+  const config = await getBillingConfig();
+  const plan = (await db.prepare('SELECT * FROM plans WHERE slug = ?').get(planSlug)) as any;
   if (!plan) {
     throw new Error('Plan not found for activation');
   }
@@ -243,14 +241,14 @@ export async function verifyAndActivateSubscription(params: {
   }
 
   const basePrice = billingCycle === 'yearly' ? plan.price_yearly : plan.price_monthly;
-  const tax = calculateGstBreakup(basePrice, customerState);
-  const invoiceNumber = generateNextInvoiceNumber();
+  const tax = calculateGstBreakup(basePrice, customerState, config.companyState);
+  const invoiceNumber = await generateNextInvoiceNumber();
   const now = Date.now();
   const paymentRecordId = uuidv4();
   const invoiceRecordId = uuidv4();
 
   // 1. Record Payment
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO payments (id, tenant_id, order_id, payment_id, amount, currency, status, method, gst_amount, gstin, invoice_number, plan_id, billing_cycle, created_at)
     VALUES (?, ?, ?, ?, ?, 'INR', 'captured', 'upi', ?, ?, ?, ?, ?, ?)
   `).run(
@@ -268,7 +266,7 @@ export async function verifyAndActivateSubscription(params: {
   );
 
   // 2. Generate GST Tax Invoice
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO invoices (id, invoice_number, tenant_id, payment_id, customer_business_name, customer_gstin, customer_address, customer_state, hsn_sac, subtotal, cgst_rate, cgst_amount, sgst_rate, sgst_amount, igst_rate, igst_amount, total_amount, currency, status, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, '998313', ?, ?, ?, ?, ?, ?, ?, ?, 'INR', 'paid', ?)
   `).run(
@@ -292,7 +290,7 @@ export async function verifyAndActivateSubscription(params: {
   );
 
   // 3. Activate Plan & Quota for Tenant
-  db.prepare(`
+  await db.prepare(`
     UPDATE tenants
     SET plan_id = ?,
         subscription_status = 'active',

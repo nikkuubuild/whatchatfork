@@ -48,8 +48,8 @@ export const saasRouter = Router();
 // ==========================================
 
 // Public Plans List for Pricing Page
-saasRouter.get('/plans', (_req, res) => {
-  const plans = db.prepare('SELECT * FROM plans WHERE is_active = 1 ORDER BY price_monthly ASC').all();
+saasRouter.get('/plans', async (_req, res) => {
+  const plans = await db.prepare('SELECT * FROM plans WHERE is_active = 1 ORDER BY price_monthly ASC').all();
   res.json({ success: true, plans });
 });
 
@@ -73,7 +73,7 @@ saasRouter.post('/auth/send-otp', async (req, res) => {
 
     if (purpose === 'registration') {
       // Check if phone already registered
-      const existingByPhone = db.prepare('SELECT id FROM users WHERE mobile = ?').get(normalized);
+      const existingByPhone = await db.prepare('SELECT id FROM users WHERE mobile = ?').get(normalized);
       if (existingByPhone) {
         return res.status(409).json({
           success: false,
@@ -84,7 +84,7 @@ saasRouter.post('/auth/send-otp', async (req, res) => {
       // Check if email already registered (if provided)
       if (email) {
         const cleanEmail = String(email).trim().toLowerCase();
-        const existingByEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
+        const existingByEmail = await db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
         if (existingByEmail) {
           return res.status(409).json({
             success: false,
@@ -124,7 +124,7 @@ saasRouter.post('/auth/send-otp', async (req, res) => {
 });
 
 // Step 2: Register New Tenant Workspace (Verifies Name, Email, Mobile with WhatsApp OTP, and Password)
-saasRouter.post('/auth/register', (req, res) => {
+saasRouter.post('/auth/register', async (req, res) => {
   try {
     const { name, businessName, email, mobile, password, otp, planSlug = 'starter' } = req.body;
     const effectiveName = (name || businessName || '').trim();
@@ -160,7 +160,7 @@ saasRouter.post('/auth/register', (req, res) => {
     }
 
     // Verify the WhatsApp OTP
-    const otpCheck = verifyWhatsAppOtp(normalizedMobile, String(otp).trim(), 'registration');
+    const otpCheck = await verifyWhatsAppOtp(normalizedMobile, String(otp).trim(), 'registration');
     if (!otpCheck.success) {
       return res.status(400).json({
         success: false,
@@ -170,21 +170,21 @@ saasRouter.post('/auth/register', (req, res) => {
     }
 
     // Double check email or mobile uniqueness
-    const existingUser = db.prepare('SELECT id FROM users WHERE email = ? OR mobile = ?').get(cleanEmail, normalizedMobile);
+    const existingUser = await db.prepare('SELECT id FROM users WHERE email = ? OR mobile = ?').get(cleanEmail, normalizedMobile);
     if (existingUser) {
       return res.status(409).json({ success: false, error: 'An account with this email or mobile number already exists.' });
     }
 
     // Resolve plan
-    const plan = db.prepare('SELECT * FROM plans WHERE slug = ?').get(planSlug) as any ||
-      db.prepare('SELECT * FROM plans LIMIT 1').get() as any;
+    const plan = ((await db.prepare('SELECT * FROM plans WHERE slug = ?').get(planSlug)) as any) ||
+      ((await db.prepare('SELECT * FROM plans LIMIT 1').get()) as any);
 
     const tenantId = `tenant_${uuidv4().substring(0, 12)}`;
     const slug = `${effectiveName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Math.random().toString(36).substring(2, 6)}`;
     const now = Date.now();
 
     // Create Tenant
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO tenants (id, name, slug, plan_id, subscription_status, monthly_message_quota, messages_used_current_cycle, created_at)
       VALUES (?, ?, ?, ?, 'active', ?, 0, ?)
     `).run(tenantId, effectiveName, slug, plan ? plan.id : null, plan ? plan.monthly_message_quota : 5000, now);
@@ -192,7 +192,7 @@ saasRouter.post('/auth/register', (req, res) => {
     // Create Tenant Owner User with verified mobile
     const userId = uuidv4();
     const passwordHash = bcrypt.hashSync(password, 10);
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO users (id, tenant_id, email, mobile, phone_verified, password_hash, name, role, created_at)
       VALUES (?, ?, ?, ?, 1, ?, ?, 'tenant_owner', ?)
     `).run(userId, tenantId, cleanEmail, normalizedMobile, passwordHash, effectiveName, now);
@@ -227,7 +227,7 @@ saasRouter.post('/auth/register', (req, res) => {
 });
 
 // Login (Supports either Email or WhatsApp Mobile Number + Password)
-saasRouter.post('/auth/login', (req, res) => {
+saasRouter.post('/auth/login', async (req, res) => {
   try {
     const { email, mobile, identifier, password } = req.body;
     const target = (identifier || email || mobile || '').trim();
@@ -239,11 +239,11 @@ saasRouter.post('/auth/login', (req, res) => {
     const cleanEmail = target.toLowerCase();
     const normalizedMobile = normalizePhoneNumber(target) || target.replace(/[^0-9]/g, '');
 
-    const userRow = db.prepare(`
+    const userRow = (await db.prepare(`
       SELECT * FROM users
       WHERE email = ? OR mobile = ? OR mobile = ?
       LIMIT 1
-    `).get(cleanEmail, normalizedMobile, target) as any;
+    `).get(cleanEmail, normalizedMobile, target)) as any;
 
     if (!userRow || !bcrypt.compareSync(password, userRow.password_hash)) {
       return res.status(401).json({
@@ -254,7 +254,7 @@ saasRouter.post('/auth/login', (req, res) => {
 
     let tenantRow: any = null;
     if (userRow.tenant_id) {
-      tenantRow = db.prepare(`
+      tenantRow = await db.prepare(`
         SELECT t.*, p.name as plan_name, p.monthly_message_quota as plan_quota
         FROM tenants t
         LEFT JOIN plans p ON t.plan_id = p.id
@@ -294,20 +294,20 @@ saasRouter.post('/auth/login', (req, res) => {
 });
 
 // Current User Profile & Active Workspace Info
-saasRouter.get('/auth/me', authenticateToken, (req: AuthenticatedRequest, res) => {
+saasRouter.get('/auth/me', authenticateToken, async (req: AuthenticatedRequest, res) => {
   const user = req.user!;
   let tenant: any = null;
   let activeChannel: any = null;
 
   if (user.tenantId) {
-    tenant = db.prepare(`
+    tenant = await db.prepare(`
       SELECT t.*, p.name as plan_name, p.max_whatsapp_numbers, p.max_team_members, p.coexistence_allowed
       FROM tenants t
       LEFT JOIN plans p ON t.plan_id = p.id
       WHERE t.id = ?
     `).get(user.tenantId);
 
-    activeChannel = db.prepare(`
+    activeChannel = await db.prepare(`
       SELECT id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, coexistence_enabled, status, connected_at
       FROM whatsapp_channels
       WHERE tenant_id = ? AND status = 'active'
@@ -328,8 +328,8 @@ saasRouter.get('/auth/me', authenticateToken, (req: AuthenticatedRequest, res) =
 // ==========================================
 
 // Get Public Embedded Signup Configuration (for FB.login frontend popup)
-saasRouter.get('/whatsapp/embedded-signup/config', (_req, res) => {
-  const config = getPlatformMetaConfig();
+saasRouter.get('/whatsapp/embedded-signup/config', async (_req, res) => {
+  const config = await getPlatformMetaConfig();
   res.json({
     success: true,
     appId: config.appId,
@@ -342,8 +342,8 @@ saasRouter.get('/whatsapp/embedded-signup/config', (_req, res) => {
 });
 
 // List Channels for Authenticated Tenant
-saasRouter.get('/whatsapp/channels', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
-  const channels = db.prepare(`
+saasRouter.get('/whatsapp/channels', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
+  const channels = await db.prepare(`
     SELECT id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, coexistence_enabled, status, connected_at, updated_at
     FROM whatsapp_channels
     WHERE tenant_id = ?
@@ -410,15 +410,15 @@ saasRouter.post('/whatsapp/connect/embedded-signup', authenticateToken, requireT
 });
 
 // Disconnect a WhatsApp Channel
-saasRouter.post('/whatsapp/channels/:channelId/disconnect', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/whatsapp/channels/:channelId/disconnect', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   const { channelId } = req.params;
-  const channel = db.prepare('SELECT id FROM whatsapp_channels WHERE id = ? AND tenant_id = ?').get(channelId as string, req.tenantId as string);
+  const channel = await db.prepare('SELECT id FROM whatsapp_channels WHERE id = ? AND tenant_id = ?').get(channelId as string, req.tenantId as string);
 
   if (!channel) {
     return res.status(404).json({ success: false, error: 'Channel not found in this workspace' });
   }
 
-  db.prepare("UPDATE whatsapp_channels SET status = 'disconnected' WHERE id = ?").run(channelId);
+  await db.prepare("UPDATE whatsapp_channels SET status = 'disconnected' WHERE id = ?").run(channelId);
   res.json({ success: true, message: 'Channel disconnected successfully' });
 });
 
@@ -426,7 +426,7 @@ saasRouter.post('/whatsapp/channels/:channelId/disconnect', authenticateToken, r
 // 3. MULTI-TENANT ISOLATED SSE STREAM
 // ==========================================
 
-saasRouter.get('/whatsapp/events', authenticateToken, requireTenant, (req: AuthenticatedRequest, res: Response) => {
+saasRouter.get('/whatsapp/events', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res: Response) => {
   const tenantId = req.tenantId!;
 
   res.writeHead(200, {
@@ -444,7 +444,7 @@ saasRouter.get('/whatsapp/events', authenticateToken, requireTenant, (req: Authe
   res.write(`data: ${JSON.stringify({ type: 'connected', clientId, tenantId, serverTime: Date.now() })}\n\n`);
 
   // Send initial backlog of latest messages & conversations for this tenant only
-  const recentMessages = db.prepare(`
+  const recentMessages = await db.prepare(`
     SELECT m.*, c.customer_phone, c.customer_name
     FROM messages m
     JOIN conversations c ON m.conversation_id = c.id
@@ -479,8 +479,8 @@ saasRouter.get('/whatsapp/events', authenticateToken, requireTenant, (req: Authe
 // ==========================================
 
 // Get Tenant Conversations
-saasRouter.get('/chats/conversations', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
-  const convs = db.prepare(`
+saasRouter.get('/chats/conversations', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
+  const convs = await db.prepare(`
     SELECT * FROM conversations
     WHERE tenant_id = ?
     ORDER BY updated_at DESC
@@ -490,9 +490,9 @@ saasRouter.get('/chats/conversations', authenticateToken, requireTenant, (req: A
 });
 
 // Get Messages for a specific conversation
-saasRouter.get('/chats/conversations/:convId/messages', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.get('/chats/conversations/:convId/messages', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   const { convId } = req.params;
-  const messages = db.prepare(`
+  const messages = await db.prepare(`
     SELECT * FROM messages
     WHERE conversation_id = ? AND tenant_id = ?
     ORDER BY created_at ASC
@@ -520,11 +520,11 @@ saasRouter.post('/whatsapp/send-message', authenticateToken, requireTenant, chec
     }
 
     // Retrieve active WhatsApp channel for this tenant, or fallback to explicit credentials
-    const channel = db.prepare(`
+    const channel = (await db.prepare(`
       SELECT * FROM whatsapp_channels
       WHERE tenant_id = ? AND status = 'active'
       ORDER BY connected_at DESC LIMIT 1
-    `).get(tenantId) as any;
+    `).get(tenantId)) as any;
 
     const effectiveToken = channel?.access_token || req.body.token;
     const effectivePhoneId = channel?.phone_number_id || req.body.phoneNumberId;
@@ -586,11 +586,11 @@ saasRouter.post('/whatsapp/send-message', authenticateToken, requireTenant, chec
     const now = Date.now();
 
     // Upsert conversation
-    let conv = db.prepare('SELECT id FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, finalPayload.to) as any;
+    let conv = (await db.prepare('SELECT id FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, finalPayload.to)) as any;
     let convId = conv ? conv.id : uuidv4();
 
     if (conv) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE conversations
         SET last_message_preview = ?, updated_at = ?
         WHERE id = ?
@@ -598,20 +598,20 @@ saasRouter.post('/whatsapp/send-message', authenticateToken, requireTenant, chec
     } else {
       const colors = ['#008069', '#128C7E', '#25D366', '#075E54', '#34B7F1'];
       const randomColor = colors[Math.floor(Math.random() * colors.length)];
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
       `).run(convId, tenantId, channel?.id || null, finalPayload.to, finalPayload.to, randomColor, text || `[${type}]`, now, now);
     }
 
     // Record message in DB
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, status, created_at)
       VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'sent', ?)
     `).run(uuidv4(), tenantId, convId, metaMsgId, type, text || '', mediaUrl || null, mediaCaption || null, filename || null, now);
 
     // Increment tenant monthly message usage
-    db.prepare(`
+    await db.prepare(`
       UPDATE tenants
       SET messages_used_current_cycle = messages_used_current_cycle + 1
       WHERE id = ?
@@ -629,15 +629,11 @@ saasRouter.post('/whatsapp/send-message', authenticateToken, requireTenant, chec
 });
 
 // ==========================================
-// 5. SUPER ADMIN CONTROL PANEL ROUTES
-// ==========================================
-
-// ==========================================
 // 5. SUPER ADMIN CONTROL PANEL & AUTH ROUTES
 // ==========================================
 
 // Dedicated Super Admin Login with Brute-Force Rate Limiting
-saasRouter.post('/admin/auth/login', (req, res) => {
+saasRouter.post('/admin/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -648,7 +644,7 @@ saasRouter.post('/admin/auth/login', (req, res) => {
     const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '127.0.0.1';
 
     // 1. Check Brute-force Lockout
-    const lockCheck = checkLoginAttempts(cleanEmail);
+    const lockCheck = await checkLoginAttempts(cleanEmail);
     if (!lockCheck.allowed) {
       return res.status(429).json({
         success: false,
@@ -657,16 +653,16 @@ saasRouter.post('/admin/auth/login', (req, res) => {
     }
 
     // 2. Fetch User & Verify role
-    const adminUser = db.prepare("SELECT * FROM users WHERE email = ? AND role = 'super_admin'").get(cleanEmail) as any;
+    const adminUser = (await db.prepare("SELECT * FROM users WHERE email = ? AND role = 'super_admin'").get(cleanEmail)) as any;
 
     if (!adminUser || !bcrypt.compareSync(password, adminUser.password_hash)) {
-      recordFailedLogin(cleanEmail);
+      await recordFailedLogin(cleanEmail);
       return res.status(401).json({ success: false, error: 'Invalid Super Admin credentials.' });
     }
 
     // 3. Reset failed attempts & log audit
-    resetLoginAttempts(cleanEmail);
-    logAdminAction({
+    await resetLoginAttempts(cleanEmail);
+    await logAdminAction({
       adminId: adminUser.id,
       adminEmail: adminUser.email,
       action: 'ADMIN_LOGIN',
@@ -707,7 +703,7 @@ saasRouter.get('/admin/auth/me', requireSuperAdminAuth, (req: AuthenticatedReque
 });
 
 // Change Super Admin Password
-saasRouter.post('/admin/auth/change-password', requireSuperAdminAuth, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/admin/auth/change-password', requireSuperAdminAuth, async (req: AuthenticatedRequest, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword || !newPassword || newPassword.length < 8) {
@@ -717,15 +713,15 @@ saasRouter.post('/admin/auth/change-password', requireSuperAdminAuth, (req: Auth
       });
     }
 
-    const admin = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user!.id) as any;
+    const admin = (await db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user!.id)) as any;
     if (!admin || !bcrypt.compareSync(currentPassword, admin.password_hash)) {
       return res.status(401).json({ success: false, error: 'Current password is incorrect.' });
     }
 
     const newHash = bcrypt.hashSync(newPassword, 10);
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, req.user!.id);
+    await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, req.user!.id);
 
-    logAdminAction({
+    await logAdminAction({
       adminId: req.user!.id,
       adminEmail: req.user!.email,
       action: 'PASSWORD_CHANGE',
@@ -739,14 +735,14 @@ saasRouter.post('/admin/auth/change-password', requireSuperAdminAuth, (req: Auth
 });
 
 // Super Admin Audit Logs
-saasRouter.get('/admin/audit-logs', requireSuperAdminAuth, (_req, res) => {
-  const logs = db.prepare('SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 100').all();
+saasRouter.get('/admin/audit-logs', requireSuperAdminAuth, async (_req, res) => {
+  const logs = await db.prepare('SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 100').all();
   res.json({ success: true, logs });
 });
 
 // Get Platform Meta Configuration
-saasRouter.get('/admin/config', requireSuperAdminAuth, (_req, res) => {
-  const config = getPlatformMetaConfig();
+saasRouter.get('/admin/config', requireSuperAdminAuth, async (_req, res) => {
+  const config = await getPlatformMetaConfig();
   res.json({
     success: true,
     config: {
@@ -757,10 +753,10 @@ saasRouter.get('/admin/config', requireSuperAdminAuth, (_req, res) => {
 });
 
 // Save Platform Meta Configuration
-saasRouter.post('/admin/config', requireSuperAdminAuth, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/admin/config', requireSuperAdminAuth, async (req: AuthenticatedRequest, res) => {
   const { appId, appSecret, configId, partnerSolutionId, webhookVerifyToken, coexistenceEnabled, graphVersion } = req.body;
 
-  savePlatformMetaConfig({
+  await savePlatformMetaConfig({
     appId,
     appSecret: appSecret && !appSecret.includes('••••') ? appSecret : undefined,
     configId,
@@ -770,7 +766,7 @@ saasRouter.post('/admin/config', requireSuperAdminAuth, (req: AuthenticatedReque
     graphVersion
   });
 
-  logAdminAction({
+  await logAdminAction({
     adminId: req.user!.id,
     adminEmail: req.user!.email,
     action: 'UPDATE_META_CONFIG',
@@ -781,8 +777,8 @@ saasRouter.post('/admin/config', requireSuperAdminAuth, (req: AuthenticatedReque
 });
 
 // List All Tenants (Super Admin)
-saasRouter.get('/admin/tenants', requireSuperAdminAuth, (_req, res) => {
-  const tenants = db.prepare(`
+saasRouter.get('/admin/tenants', requireSuperAdminAuth, async (_req, res) => {
+  const tenants = await db.prepare(`
     SELECT t.*, p.name as plan_name,
            (SELECT count(*) FROM whatsapp_channels wc WHERE wc.tenant_id = t.id) as channel_count,
            (SELECT count(*) FROM users u WHERE u.tenant_id = t.id) as user_count
@@ -795,22 +791,22 @@ saasRouter.get('/admin/tenants', requireSuperAdminAuth, (_req, res) => {
 });
 
 // Update Tenant Status (Activate / Suspend)
-saasRouter.post('/admin/tenants/:id/status', requireSuperAdminAuth, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/admin/tenants/:id/status', requireSuperAdminAuth, async (req: AuthenticatedRequest, res) => {
   const { id } = req.params;
   const { status, monthlyQuota } = req.body;
 
   if (status) {
-    db.prepare('UPDATE tenants SET subscription_status = ? WHERE id = ?').run(status, id);
+    await db.prepare('UPDATE tenants SET subscription_status = ? WHERE id = ?').run(status, id);
   }
   if (typeof monthlyQuota === 'number') {
-    db.prepare('UPDATE tenants SET monthly_message_quota = ? WHERE id = ?').run(monthlyQuota, id);
+    await db.prepare('UPDATE tenants SET monthly_message_quota = ? WHERE id = ?').run(monthlyQuota, id);
   }
 
-  logAdminAction({
+  await logAdminAction({
     adminId: req.user!.id,
     adminEmail: req.user!.email,
     action: 'UPDATE_TENANT_STATUS',
-    targetId: id,
+    targetId: id as string,
     details: `Status set to ${status || 'unchanged'}, quota: ${monthlyQuota ?? 'unchanged'}`
   });
 
@@ -821,12 +817,12 @@ saasRouter.post('/admin/tenants/:id/status', requireSuperAdminAuth, (req: Authen
 // 6. CUSTOMER ONBOARDING & TENANT PROFILE (KYC)
 // ==========================================
 
-saasRouter.get('/tenant/profile', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
-  const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string);
+saasRouter.get('/tenant/profile', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
+  const tenant = await db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string);
   res.json({ success: true, tenant });
 });
 
-saasRouter.put('/tenant/profile', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.put('/tenant/profile', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   try {
     const {
       legalBusinessName,
@@ -851,7 +847,7 @@ saasRouter.put('/tenant/profile', authenticateToken, requireTenant, (req: Authen
       return res.status(400).json({ success: false, error: 'Invalid GSTIN format. Must be 15 alphanumeric characters.' });
     }
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE tenants
       SET legal_business_name = COALESCE(?, legal_business_name),
           business_type = COALESCE(?, business_type),
@@ -878,7 +874,7 @@ saasRouter.put('/tenant/profile', authenticateToken, requireTenant, (req: Authen
       req.tenantId as string
     );
 
-    const updated = db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string);
+    const updated = await db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string);
     res.json({ success: true, message: 'Business profile updated successfully', tenant: updated });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message || 'Failed to update business profile' });
@@ -896,7 +892,7 @@ saasRouter.post('/billing/order', authenticateToken, requireTenant, async (req: 
       return res.status(400).json({ success: false, error: 'Plan slug is required.' });
     }
 
-    const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string) as any;
+    const tenant = (await db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string)) as any;
 
     const orderData = await createSubscriptionOrder({
       tenantId: req.tenantId!,
@@ -921,7 +917,7 @@ saasRouter.post('/billing/verify', authenticateToken, requireTenant, async (req:
       return res.status(400).json({ success: false, error: 'orderId, paymentId, and planSlug are required.' });
     }
 
-    const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string) as any;
+    const tenant = (await db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.tenantId as string)) as any;
 
     const activationResult = await verifyAndActivateSubscription({
       tenantId: req.tenantId!,
@@ -943,26 +939,26 @@ saasRouter.post('/billing/verify', authenticateToken, requireTenant, async (req:
   }
 });
 
-saasRouter.post('/billing/validate-coupon', authenticateToken, (req, res) => {
+saasRouter.post('/billing/validate-coupon', authenticateToken, async (req, res) => {
   const { code } = req.body;
   if (!code) {
     return res.status(400).json({ success: false, error: 'Coupon code required' });
   }
-  const result = validateCoupon(String(code));
+  const result = await validateCoupon(String(code));
   res.json({ success: result.valid, ...result });
 });
 
-saasRouter.get('/billing/invoices', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
-  const invoices = db.prepare('SELECT * FROM invoices WHERE tenant_id = ? ORDER BY created_at DESC').all(req.tenantId as string);
+saasRouter.get('/billing/invoices', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
+  const invoices = await db.prepare('SELECT * FROM invoices WHERE tenant_id = ? ORDER BY created_at DESC').all(req.tenantId as string);
   res.json({ success: true, invoices });
 });
 
-saasRouter.get('/billing/invoices/:id', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
-  const invoice = db.prepare('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?').get(req.params.id as string, req.tenantId as string);
+saasRouter.get('/billing/invoices/:id', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
+  const invoice = await db.prepare('SELECT * FROM invoices WHERE id = ? AND tenant_id = ?').get(req.params.id as string, req.tenantId as string);
   if (!invoice) {
     return res.status(404).json({ success: false, error: 'Invoice not found' });
   }
-  const config = getBillingConfig();
+  const config = await getBillingConfig();
   res.json({
     success: true,
     invoice,
@@ -979,7 +975,7 @@ saasRouter.get('/billing/invoices/:id', authenticateToken, requireTenant, (req: 
 // 8. CRM CONTACTS & SEGMENTATION
 // ==========================================
 
-saasRouter.get('/contacts', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.get('/contacts', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   const { q, tag } = req.query;
   let sql = 'SELECT * FROM contacts WHERE tenant_id = ?';
   const params: any[] = [req.tenantId as string];
@@ -995,11 +991,11 @@ saasRouter.get('/contacts', authenticateToken, requireTenant, (req: Authenticate
   }
 
   sql += ' ORDER BY updated_at DESC LIMIT 200';
-  const contacts = db.prepare(sql).all(...params);
+  const contacts = await db.prepare(sql).all(...params);
   res.json({ success: true, contacts });
 });
 
-saasRouter.post('/contacts', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/contacts', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   try {
     const { phone, name, email, tags, notes, customAttributes } = req.body;
     if (!phone) {
@@ -1011,11 +1007,11 @@ saasRouter.post('/contacts', authenticateToken, requireTenant, (req: Authenticat
     const tagsJson = Array.isArray(tags) ? JSON.stringify(tags) : (tags || '[]');
     const customJson = typeof customAttributes === 'object' ? JSON.stringify(customAttributes) : (customAttributes || '{}');
 
-    const existing = db.prepare('SELECT id FROM contacts WHERE tenant_id = ? AND phone = ?').get(req.tenantId as string, cleanPhone) as any;
+    const existing = (await db.prepare('SELECT id FROM contacts WHERE tenant_id = ? AND phone = ?').get(req.tenantId as string, cleanPhone)) as any;
     const contactId = existing?.id || uuidv4();
 
     if (existing) {
-      db.prepare(`
+      await db.prepare(`
         UPDATE contacts
         SET name = COALESCE(?, name),
             email = COALESCE(?, email),
@@ -1026,20 +1022,20 @@ saasRouter.post('/contacts', authenticateToken, requireTenant, (req: Authenticat
         WHERE id = ?
       `).run(name || null, email || null, tagsJson, customJson, notes || null, now, contactId);
     } else {
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO contacts (id, tenant_id, phone, name, email, tags, custom_attributes, notes, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(contactId, req.tenantId as string, cleanPhone, name || cleanPhone, email || null, tagsJson, customJson, notes || null, now, now);
     }
 
-    const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(contactId);
+    const contact = await db.prepare('SELECT * FROM contacts WHERE id = ?').get(contactId);
     res.json({ success: true, contact });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message || 'Failed to save contact' });
   }
 });
 
-saasRouter.post('/contacts/import-csv', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/contacts/import-csv', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   try {
     const { contacts } = req.body;
     if (!Array.isArray(contacts) || contacts.length === 0) {
@@ -1063,7 +1059,7 @@ saasRouter.post('/contacts/import-csv', authenticateToken, requireTenant, (req: 
       const cleanPhone = String(c.phone || '').replace(/[^0-9]/g, '');
       if (cleanPhone.length >= 7) {
         const tagsJson = Array.isArray(c.tags) ? JSON.stringify(c.tags) : JSON.stringify([c.tags || 'imported']);
-        upsertStmt.run(
+        await upsertStmt.run(
           uuidv4(),
           req.tenantId as string,
           cleanPhone,
@@ -1084,8 +1080,8 @@ saasRouter.post('/contacts/import-csv', authenticateToken, requireTenant, (req: 
   }
 });
 
-saasRouter.delete('/contacts/:id', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
-  db.prepare('DELETE FROM contacts WHERE id = ? AND tenant_id = ?').run(req.params.id as string, req.tenantId as string);
+saasRouter.delete('/contacts/:id', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
+  await db.prepare('DELETE FROM contacts WHERE id = ? AND tenant_id = ?').run(req.params.id as string, req.tenantId as string);
   res.json({ success: true, message: 'Contact deleted.' });
 });
 
@@ -1093,8 +1089,8 @@ saasRouter.delete('/contacts/:id', authenticateToken, requireTenant, (req: Authe
 // 9. TEAM COLLABORATION & CONVERSATION MANAGEMENT
 // ==========================================
 
-saasRouter.get('/team/members', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
-  const members = db.prepare(`
+saasRouter.get('/team/members', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
+  const members = await db.prepare(`
     SELECT id, email, name, role, created_at
     FROM users
     WHERE tenant_id = ?
@@ -1104,21 +1100,21 @@ saasRouter.get('/team/members', authenticateToken, requireTenant, (req: Authenti
   res.json({ success: true, members });
 });
 
-saasRouter.post('/team/members', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/team/members', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   try {
     const { email, name, role = 'agent', password } = req.body;
     if (!email || !name) {
       return res.status(400).json({ success: false, error: 'Email and name are required.' });
     }
 
-    const tenant = db.prepare(`
+    const tenant = (await db.prepare(`
       SELECT t.*, p.max_team_members
       FROM tenants t
       LEFT JOIN plans p ON t.plan_id = p.id
       WHERE t.id = ?
-    `).get(req.tenantId as string) as any;
+    `).get(req.tenantId as string)) as any;
 
-    const currentMemberCount = db.prepare('SELECT count(*) as count FROM users WHERE tenant_id = ?').get(req.tenantId as string) as { count: number | bigint };
+    const currentMemberCount = (await db.prepare('SELECT count(*) as count FROM users WHERE tenant_id = ?').get(req.tenantId as string)) as { count: number | bigint | string } | undefined;
     const maxAllowed = tenant?.max_team_members || 2;
 
     if (Number(currentMemberCount?.count || 0) >= maxAllowed) {
@@ -1129,7 +1125,7 @@ saasRouter.post('/team/members', authenticateToken, requireTenant, (req: Authent
     }
 
     const cleanEmail = String(email).trim().toLowerCase();
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
+    const existing = await db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
     if (existing) {
       return res.status(409).json({ success: false, error: 'A user with this email already exists.' });
     }
@@ -1139,7 +1135,7 @@ saasRouter.post('/team/members', authenticateToken, requireTenant, (req: Authent
     const userId = uuidv4();
     const now = Date.now();
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO users (id, tenant_id, email, password_hash, name, role, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(userId, req.tenantId as string, cleanEmail, pwdHash, name.trim(), role, now);
@@ -1153,32 +1149,32 @@ saasRouter.post('/team/members', authenticateToken, requireTenant, (req: Authent
   }
 });
 
-saasRouter.delete('/team/members/:id', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.delete('/team/members/:id', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   if (req.user!.id === req.params.id) {
     return res.status(400).json({ success: false, error: 'Cannot remove yourself from the workspace.' });
   }
 
-  db.prepare('DELETE FROM users WHERE id = ? AND tenant_id = ?').run(req.params.id as string, req.tenantId as string);
+  await db.prepare('DELETE FROM users WHERE id = ? AND tenant_id = ?').run(req.params.id as string, req.tenantId as string);
   res.json({ success: true, message: 'Team member removed.' });
 });
 
-saasRouter.post('/chats/conversations/:id/assign', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/chats/conversations/:id/assign', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   const { assignedToUserId } = req.body;
-  db.prepare('UPDATE conversations SET assigned_to_user_id = ? WHERE id = ? AND tenant_id = ?')
+  await db.prepare('UPDATE conversations SET assigned_to_user_id = ? WHERE id = ? AND tenant_id = ?')
     .run(assignedToUserId || null, req.params.id as string, req.tenantId as string);
   res.json({ success: true, message: 'Conversation assignment updated.' });
 });
 
-saasRouter.post('/chats/conversations/:id/notes', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/chats/conversations/:id/notes', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   const { notes } = req.body;
-  db.prepare('UPDATE conversations SET internal_notes = ? WHERE id = ? AND tenant_id = ?')
+  await db.prepare('UPDATE conversations SET internal_notes = ? WHERE id = ? AND tenant_id = ?')
     .run(notes || null, req.params.id as string, req.tenantId as string);
   res.json({ success: true, message: 'Internal notes saved.' });
 });
 
-saasRouter.post('/chats/conversations/:id/status', authenticateToken, requireTenant, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/chats/conversations/:id/status', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res) => {
   const { status } = req.body;
-  db.prepare('UPDATE conversations SET status = ? WHERE id = ? AND tenant_id = ?')
+  await db.prepare('UPDATE conversations SET status = ? WHERE id = ? AND tenant_id = ?')
     .run(status || 'open', req.params.id as string, req.tenantId as string);
   res.json({ success: true, message: 'Conversation status updated.' });
 });
@@ -1187,21 +1183,21 @@ saasRouter.post('/chats/conversations/:id/status', authenticateToken, requireTen
 // 10. SUPER ADMIN BI ANALYTICS & BILLING CONFIG
 // ==========================================
 
-saasRouter.get('/admin/analytics', requireSuperAdminAuth, (_req, res) => {
+saasRouter.get('/admin/analytics', requireSuperAdminAuth, async (_req, res) => {
   try {
-    const totalTenantsRow = db.prepare('SELECT count(*) as count FROM tenants').get() as { count: number | bigint };
-    const activeSubscribersRow = db.prepare("SELECT count(*) as count FROM tenants WHERE subscription_status = 'active'").get() as { count: number | bigint };
-    const totalMessagesRow = db.prepare('SELECT count(*) as count FROM messages').get() as { count: number | bigint };
-    const totalPaymentsRow = db.prepare("SELECT COALESCE(SUM(amount), 0) as total, count(*) as count FROM payments WHERE status = 'captured'").get() as { total: number, count: number | bigint };
-    const totalChannelsRow = db.prepare('SELECT count(*) as count FROM whatsapp_channels').get() as { count: number | bigint };
-    const activeChannelsRow = db.prepare("SELECT count(*) as count FROM whatsapp_channels WHERE status = 'active'").get() as { count: number | bigint };
-    const failedWebhooksRow = db.prepare("SELECT count(*) as count FROM webhook_logs WHERE event_type LIKE '%fail%' OR event_type LIKE '%error%'").get() as { count: number | bigint };
+    const totalTenantsRow = (await db.prepare('SELECT count(*) as count FROM tenants').get()) as { count: number | bigint | string } | undefined;
+    const activeSubscribersRow = (await db.prepare("SELECT count(*) as count FROM tenants WHERE subscription_status = 'active'").get()) as { count: number | bigint | string } | undefined;
+    const totalMessagesRow = (await db.prepare('SELECT count(*) as count FROM messages').get()) as { count: number | bigint | string } | undefined;
+    const totalPaymentsRow = (await db.prepare("SELECT COALESCE(SUM(amount), 0) as total, count(*) as count FROM payments WHERE status = 'captured'").get()) as { total: number | string, count: number | bigint | string } | undefined;
+    const totalChannelsRow = (await db.prepare('SELECT count(*) as count FROM whatsapp_channels').get()) as { count: number | bigint | string } | undefined;
+    const activeChannelsRow = (await db.prepare("SELECT count(*) as count FROM whatsapp_channels WHERE status = 'active'").get()) as { count: number | bigint | string } | undefined;
+    const failedWebhooksRow = (await db.prepare("SELECT count(*) as count FROM webhook_logs WHERE event_type LIKE '%fail%' OR event_type LIKE '%error%'").get()) as { count: number | bigint | string } | undefined;
 
-    const planDistribution = db.prepare(`
+    const planDistribution = await db.prepare(`
       SELECT p.name, p.slug, p.price_monthly, count(t.id) as subscriber_count
       FROM plans p
       LEFT JOIN tenants t ON t.plan_id = p.id
-      GROUP BY p.id
+      GROUP BY p.id, p.name, p.slug, p.price_monthly
     `).all();
 
     let mrr = 0;
@@ -1210,7 +1206,7 @@ saasRouter.get('/admin/analytics', requireSuperAdminAuth, (_req, res) => {
     });
     const arr = mrr * 12;
 
-    const recentPayments = db.prepare(`
+    const recentPayments = await db.prepare(`
       SELECT p.*, t.name as tenant_name
       FROM payments p
       LEFT JOIN tenants t ON p.tenant_id = t.id
@@ -1239,8 +1235,8 @@ saasRouter.get('/admin/analytics', requireSuperAdminAuth, (_req, res) => {
   }
 });
 
-saasRouter.get('/admin/billing/config', requireSuperAdminAuth, (_req, res) => {
-  const config = getBillingConfig();
+saasRouter.get('/admin/billing/config', requireSuperAdminAuth, async (_req, res) => {
+  const config = await getBillingConfig();
   res.json({
     success: true,
     config: {
@@ -1250,9 +1246,9 @@ saasRouter.get('/admin/billing/config', requireSuperAdminAuth, (_req, res) => {
   });
 });
 
-saasRouter.post('/admin/billing/config', requireSuperAdminAuth, (req: AuthenticatedRequest, res) => {
+saasRouter.post('/admin/billing/config', requireSuperAdminAuth, async (req: AuthenticatedRequest, res) => {
   const { razorpayKeyId, razorpayKeySecret, companyName, companyGstin, companyState, companyAddress } = req.body;
-  saveBillingConfig({
+  await saveBillingConfig({
     razorpayKeyId,
     razorpayKeySecret: razorpayKeySecret && !razorpayKeySecret.includes('••••') ? razorpayKeySecret : undefined,
     companyName,
@@ -1261,7 +1257,7 @@ saasRouter.post('/admin/billing/config', requireSuperAdminAuth, (req: Authentica
     companyAddress
   });
 
-  logAdminAction({
+  await logAdminAction({
     adminId: req.user!.id,
     adminEmail: req.user!.email,
     action: 'UPDATE_BILLING_CONFIG',
@@ -1271,16 +1267,16 @@ saasRouter.post('/admin/billing/config', requireSuperAdminAuth, (req: Authentica
   res.json({ success: true, message: 'Billing and GST configuration updated.' });
 });
 
-saasRouter.get('/admin/plans', requireSuperAdminAuth, (_req, res) => {
-  const plans = db.prepare('SELECT * FROM plans ORDER BY price_monthly ASC').all();
+saasRouter.get('/admin/plans', requireSuperAdminAuth, async (_req, res) => {
+  const plans = await db.prepare('SELECT * FROM plans ORDER BY price_monthly ASC').all();
   res.json({ success: true, plans });
 });
 
-saasRouter.put('/admin/plans/:id', requireSuperAdminAuth, (req: AuthenticatedRequest, res) => {
+saasRouter.put('/admin/plans/:id', requireSuperAdminAuth, async (req: AuthenticatedRequest, res) => {
   const { id } = req.params;
   const { name, priceMonthly, priceYearly, maxNumbers, maxMembers, monthlyQuota, coexistenceAllowed, isActive } = req.body;
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE plans
     SET name = COALESCE(?, name),
         price_monthly = COALESCE(?, price_monthly),
@@ -1300,14 +1296,14 @@ saasRouter.put('/admin/plans/:id', requireSuperAdminAuth, (req: AuthenticatedReq
     monthlyQuota ?? null,
     coexistenceAllowed !== undefined ? (coexistenceAllowed ? 1 : 0) : null,
     isActive !== undefined ? (isActive ? 1 : 0) : null,
-    id
+    id as string
   );
 
-  logAdminAction({
+  await logAdminAction({
     adminId: req.user!.id,
     adminEmail: req.user!.email,
     action: 'UPDATE_PLAN',
-    targetId: id,
+    targetId: id as string,
     details: `Updated plan ${id} settings`
   });
 

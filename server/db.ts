@@ -1,3 +1,4 @@
+import pg from 'pg';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import fs from 'fs';
@@ -5,37 +6,128 @@ import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 
+const { Pool } = pg;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, '..', 'data');
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+const databaseUrl = process.env.DATABASE_URL;
+export const isPostgres = Boolean(databaseUrl && databaseUrl.trim().length > 0);
+
+let pool: pg.Pool | null = null;
+let sqliteDb: DatabaseSync | null = null;
+
+if (isPostgres) {
+  const connStr = databaseUrl!.trim();
+  const isLocal = connStr.includes('localhost') || connStr.includes('127.0.0.1');
+  pool = new Pool({
+    connectionString: connStr,
+    ssl: isLocal ? false : { rejectUnauthorized: false },
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+  });
+  console.log('[Database] Initialized PostgreSQL connection pool with DATABASE_URL');
+} else {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  const DB_PATH = path.join(DATA_DIR, 'saas_platform.sqlite');
+  sqliteDb = new DatabaseSync(DB_PATH);
+  sqliteDb.exec('PRAGMA journal_mode = WAL;');
+  sqliteDb.exec('PRAGMA foreign_keys = ON;');
+  console.log('[Database] Initialized local SQLite fallback at', DB_PATH);
 }
 
-const DB_PATH = path.join(DATA_DIR, 'saas_platform.sqlite');
-export const db = new DatabaseSync(DB_PATH);
+/**
+ * Translates ? placeholders to PostgreSQL $1, $2, ... placeholders.
+ */
+function toPgSql(sql: string): string {
+  let paramIndex = 1;
+  return sql.replace(/\?/g, () => `$${paramIndex++}`);
+}
 
-// Enable WAL mode & foreign keys
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA foreign_keys = ON;');
+/**
+ * Unified Database Interface: supports both PostgreSQL and SQLite
+ */
+export const db = {
+  isPostgres: () => isPostgres,
 
-export function initDatabase() {
-  db.exec(`
-    -- Platform-wide configuration (Super Admin settings)
-    CREATE TABLE IF NOT EXISTS platform_config (
+  async query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    if (pool) {
+      const res = await pool.query(toPgSql(sql), params);
+      return res.rows as T[];
+    } else {
+      return sqliteDb!.prepare(sql).all(...params) as T[];
+    }
+  },
+
+  async get<T = any>(sql: string, params: any[] = []): Promise<T | undefined> {
+    if (pool) {
+      const res = await pool.query(toPgSql(sql), params);
+      return (res.rows[0] as T) || undefined;
+    } else {
+      return (sqliteDb!.prepare(sql).get(...params) as T) || undefined;
+    }
+  },
+
+  async all<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    return this.query<T>(sql, params);
+  },
+
+  async run(sql: string, params: any[] = []): Promise<{ changes: number }> {
+    if (pool) {
+      const res = await pool.query(toPgSql(sql), params);
+      return { changes: res.rowCount || 0 };
+    } else {
+      sqliteDb!.prepare(sql).run(...params);
+      return { changes: 1 };
+    }
+  },
+
+  async exec(sql: string): Promise<void> {
+    if (pool) {
+      await pool.query(sql);
+    } else {
+      sqliteDb!.exec(sql);
+    }
+  },
+
+  prepare(sql: string) {
+    return {
+      get: async <T = any>(...params: any[]): Promise<T | undefined> => {
+        const flatParams = params.length === 1 && Array.isArray(params[0]) ? params[0] : params;
+        return db.get<T>(sql, flatParams);
+      },
+      all: async <T = any>(...params: any[]): Promise<T[]> => {
+        const flatParams = params.length === 1 && Array.isArray(params[0]) ? params[0] : params;
+        return db.all<T>(sql, flatParams);
+      },
+      run: async (...params: any[]): Promise<{ changes: number }> => {
+        const flatParams = params.length === 1 && Array.isArray(params[0]) ? params[0] : params;
+        return db.run(sql, flatParams);
+      }
+    };
+  }
+};
+
+export async function initDatabase() {
+  console.log(`[Database] Initializing schema (${isPostgres ? 'PostgreSQL' : 'SQLite'})...`);
+
+  const ddlStatements = [
+    `CREATE TABLE IF NOT EXISTS platform_config (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
+      updated_at BIGINT NOT NULL
+    );`,
 
-    -- Subscription Plans
-    CREATE TABLE IF NOT EXISTS plans (
+    `CREATE TABLE IF NOT EXISTS plans (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       slug TEXT UNIQUE NOT NULL,
-      price_monthly REAL NOT NULL DEFAULT 0,
-      price_yearly REAL NOT NULL DEFAULT 0,
+      price_monthly DOUBLE PRECISION NOT NULL DEFAULT 0,
+      price_yearly DOUBLE PRECISION NOT NULL DEFAULT 0,
       currency TEXT NOT NULL DEFAULT 'INR',
       max_whatsapp_numbers INTEGER NOT NULL DEFAULT 1,
       max_team_members INTEGER NOT NULL DEFAULT 2,
@@ -43,44 +135,47 @@ export function initDatabase() {
       coexistence_allowed INTEGER NOT NULL DEFAULT 1,
       campaigns_allowed INTEGER NOT NULL DEFAULT 1,
       is_active INTEGER NOT NULL DEFAULT 1,
-      created_at INTEGER NOT NULL
-    );
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- Tenants / Businesses / Workspaces
-    CREATE TABLE IF NOT EXISTS tenants (
+    `CREATE TABLE IF NOT EXISTS tenants (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       slug TEXT UNIQUE NOT NULL,
       plan_id TEXT REFERENCES plans(id),
-      subscription_status TEXT NOT NULL DEFAULT 'active', -- active, past_due, canceled, trial
+      subscription_status TEXT NOT NULL DEFAULT 'active',
       monthly_message_quota INTEGER NOT NULL DEFAULT 1000,
       messages_used_current_cycle INTEGER NOT NULL DEFAULT 0,
       legal_business_name TEXT,
+      business_type TEXT,
       gstin TEXT,
       pan TEXT,
       registered_address TEXT,
       state TEXT,
       pincode TEXT,
       billing_contact TEXT,
-      created_at INTEGER NOT NULL
-    );
+      billing_contact_name TEXT,
+      billing_contact_phone TEXT,
+      billing_contact_email TEXT,
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- Users & Team Members
-    CREATE TABLE IF NOT EXISTS users (
+    `CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       name TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'agent', -- super_admin, tenant_owner, tenant_admin, agent
-      created_at INTEGER NOT NULL
-    );
+      role TEXT NOT NULL DEFAULT 'agent',
+      mobile TEXT,
+      phone_verified INTEGER DEFAULT 0,
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- WhatsApp Business Connections / Channels
-    CREATE TABLE IF NOT EXISTS whatsapp_channels (
+    `CREATE TABLE IF NOT EXISTS whatsapp_channels (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-      connection_mode TEXT NOT NULL DEFAULT 'byo_meta', -- 'byo_meta' or 'embedded_signup'
+      connection_mode TEXT NOT NULL DEFAULT 'byo_meta',
       waba_id TEXT,
       phone_number_id TEXT UNIQUE,
       display_phone_number TEXT,
@@ -90,13 +185,12 @@ export function initDatabase() {
       app_secret TEXT,
       coexistence_enabled INTEGER NOT NULL DEFAULT 0,
       webhook_verify_token TEXT,
-      status TEXT NOT NULL DEFAULT 'active', -- 'active', 'disconnected', 'rate_limited'
-      connected_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
+      status TEXT NOT NULL DEFAULT 'active',
+      connected_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );`,
 
-    -- In-App Conversations
-    CREATE TABLE IF NOT EXISTS conversations (
+    `CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       channel_id TEXT REFERENCES whatsapp_channels(id) ON DELETE SET NULL,
@@ -105,39 +199,40 @@ export function initDatabase() {
       avatar_color TEXT,
       unread_count INTEGER NOT NULL DEFAULT 0,
       last_message_preview TEXT,
-      updated_at INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      assigned_to_user_id TEXT,
+      internal_notes TEXT,
+      tags TEXT,
+      status TEXT DEFAULT 'open',
+      updated_at BIGINT NOT NULL,
+      created_at BIGINT NOT NULL,
       UNIQUE(tenant_id, customer_phone)
-    );
+    );`,
 
-    -- Messages
-    CREATE TABLE IF NOT EXISTS messages (
+    `CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
       meta_message_id TEXT,
       from_me INTEGER NOT NULL DEFAULT 0,
-      type TEXT NOT NULL DEFAULT 'text', -- 'text', 'image', 'video', 'audio', 'document', 'location', 'template'
+      type TEXT NOT NULL DEFAULT 'text',
       text TEXT,
       media_url TEXT,
       media_caption TEXT,
       filename TEXT,
       location_json TEXT,
-      status TEXT NOT NULL DEFAULT 'sent', -- 'pending', 'sent', 'delivered', 'read', 'failed'
-      created_at INTEGER NOT NULL
-    );
+      status TEXT NOT NULL DEFAULT 'sent',
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- Audit & Webhook Logs
-    CREATE TABLE IF NOT EXISTS webhook_logs (
+    `CREATE TABLE IF NOT EXISTS webhook_logs (
       id TEXT PRIMARY KEY,
       tenant_id TEXT,
       event_type TEXT NOT NULL,
       payload_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- Super Admin Audit Logs
-    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+    `CREATE TABLE IF NOT EXISTS admin_audit_logs (
       id TEXT PRIMARY KEY,
       admin_id TEXT NOT NULL,
       admin_email TEXT NOT NULL,
@@ -145,37 +240,34 @@ export function initDatabase() {
       target_id TEXT,
       details TEXT,
       ip_address TEXT,
-      created_at INTEGER NOT NULL
-    );
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- Brute-Force Login Attempt Protection
-    CREATE TABLE IF NOT EXISTS login_attempts (
-      key TEXT PRIMARY KEY, -- email or ip
+    `CREATE TABLE IF NOT EXISTS login_attempts (
+      key TEXT PRIMARY KEY,
       attempts INTEGER NOT NULL DEFAULT 1,
-      locked_until INTEGER NOT NULL DEFAULT 0,
-      last_attempt INTEGER NOT NULL
-    );
+      locked_until BIGINT NOT NULL DEFAULT 0,
+      last_attempt BIGINT NOT NULL
+    );`,
 
-    -- Indian Market Billing: Payments Ledger
-    CREATE TABLE IF NOT EXISTS payments (
+    `CREATE TABLE IF NOT EXISTS payments (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       order_id TEXT,
       payment_id TEXT,
-      amount REAL NOT NULL,
+      amount DOUBLE PRECISION NOT NULL,
       currency TEXT NOT NULL DEFAULT 'INR',
-      status TEXT NOT NULL DEFAULT 'captured', -- created, captured, failed, refunded
-      method TEXT NOT NULL DEFAULT 'upi', -- upi, card, netbanking, wallet
-      gst_amount REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'captured',
+      method TEXT NOT NULL DEFAULT 'upi',
+      gst_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
       gstin TEXT,
       invoice_number TEXT,
       plan_id TEXT REFERENCES plans(id),
-      billing_cycle TEXT NOT NULL DEFAULT 'monthly', -- monthly, yearly
-      created_at INTEGER NOT NULL
-    );
+      billing_cycle TEXT NOT NULL DEFAULT 'monthly',
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- GST-Compliant Tax Invoices
-    CREATE TABLE IF NOT EXISTS invoices (
+    `CREATE TABLE IF NOT EXISTS invoices (
       id TEXT PRIMARY KEY,
       invoice_number TEXT UNIQUE NOT NULL,
       tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -184,64 +276,60 @@ export function initDatabase() {
       customer_gstin TEXT,
       customer_address TEXT,
       customer_state TEXT,
-      hsn_sac TEXT NOT NULL DEFAULT '998313', -- Information Technology / SaaS
-      subtotal REAL NOT NULL,
-      cgst_rate REAL NOT NULL DEFAULT 0.09,
-      cgst_amount REAL NOT NULL DEFAULT 0,
-      sgst_rate REAL NOT NULL DEFAULT 0.09,
-      sgst_amount REAL NOT NULL DEFAULT 0,
-      igst_rate REAL NOT NULL DEFAULT 0.18,
-      igst_amount REAL NOT NULL DEFAULT 0,
-      total_amount REAL NOT NULL,
+      hsn_sac TEXT NOT NULL DEFAULT '998313',
+      subtotal DOUBLE PRECISION NOT NULL,
+      cgst_rate DOUBLE PRECISION NOT NULL DEFAULT 0.09,
+      cgst_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+      sgst_rate DOUBLE PRECISION NOT NULL DEFAULT 0.09,
+      sgst_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+      igst_rate DOUBLE PRECISION NOT NULL DEFAULT 0.18,
+      igst_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+      total_amount DOUBLE PRECISION NOT NULL,
       currency TEXT NOT NULL DEFAULT 'INR',
-      status TEXT NOT NULL DEFAULT 'paid', -- paid, void, refund_initiated
-      created_at INTEGER NOT NULL
-    );
+      status TEXT NOT NULL DEFAULT 'paid',
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- Promotional & Discount Coupons
-    CREATE TABLE IF NOT EXISTS coupons (
+    `CREATE TABLE IF NOT EXISTS coupons (
       id TEXT PRIMARY KEY,
       code TEXT UNIQUE NOT NULL,
       discount_percent INTEGER NOT NULL DEFAULT 0,
-      discount_amount REAL NOT NULL DEFAULT 0,
+      discount_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
       max_uses INTEGER NOT NULL DEFAULT 100,
       uses_count INTEGER NOT NULL DEFAULT 0,
       is_active INTEGER NOT NULL DEFAULT 1,
-      created_at INTEGER NOT NULL
-    );
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- CRM Contacts & Customer Segmentation
-    CREATE TABLE IF NOT EXISTS contacts (
+    `CREATE TABLE IF NOT EXISTS contacts (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       phone TEXT NOT NULL,
       name TEXT,
       email TEXT,
-      tags TEXT, -- JSON array of tags e.g. ["lead", "vip"]
-      custom_attributes TEXT, -- JSON key-value pairs
+      tags TEXT,
+      custom_attributes TEXT,
       notes TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
       UNIQUE(tenant_id, phone)
-    );
+    );`,
 
-    -- WhatsApp Message Templates Sync & Library
-    CREATE TABLE IF NOT EXISTS message_templates (
+    `CREATE TABLE IF NOT EXISTS message_templates (
       id TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
       meta_template_id TEXT,
       name TEXT NOT NULL,
       language TEXT NOT NULL DEFAULT 'en_US',
-      category TEXT NOT NULL, -- MARKETING, UTILITY, AUTHENTICATION
-      status TEXT NOT NULL DEFAULT 'APPROVED', -- APPROVED, PENDING, REJECTED
+      category TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'APPROVED',
       components_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
       UNIQUE(tenant_id, name, language)
-    );
+    );`,
 
-    -- WhatsApp OTP Verification Records
-    CREATE TABLE IF NOT EXISTS otp_verifications (
+    `CREATE TABLE IF NOT EXISTS otp_verifications (
       id TEXT PRIMARY KEY,
       phone TEXT NOT NULL,
       otp_hash TEXT NOT NULL,
@@ -250,59 +338,78 @@ export function initDatabase() {
       attempts INTEGER NOT NULL DEFAULT 0,
       max_attempts INTEGER NOT NULL DEFAULT 5,
       verified INTEGER NOT NULL DEFAULT 0,
-      expires_at INTEGER NOT NULL,
-      created_at INTEGER NOT NULL
-    );
+      expires_at BIGINT NOT NULL,
+      created_at BIGINT NOT NULL
+    );`,
 
-    -- OTP Rate Limiting Table (sliding window per phone and IP)
-    CREATE TABLE IF NOT EXISTS otp_rate_limits (
+    `CREATE TABLE IF NOT EXISTS otp_rate_limits (
       key TEXT PRIMARY KEY,
       requests_count INTEGER NOT NULL DEFAULT 1,
-      window_start INTEGER NOT NULL,
-      last_request INTEGER NOT NULL
-    );
+      window_start BIGINT NOT NULL,
+      last_request BIGINT NOT NULL
+    );`,
 
-    -- Indexes for high-speed multi-tenant queries
-    CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
-    CREATE INDEX IF NOT EXISTS idx_messages_meta_id ON messages(meta_message_id);
-    CREATE INDEX IF NOT EXISTS idx_channels_phone_id ON whatsapp_channels(phone_number_id);
-    CREATE INDEX IF NOT EXISTS idx_channels_waba_id ON whatsapp_channels(waba_id);
-    CREATE INDEX IF NOT EXISTS idx_channels_tenant ON whatsapp_channels(tenant_id);
-    CREATE INDEX IF NOT EXISTS idx_conv_tenant ON conversations(tenant_id, updated_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_contacts_tenant ON contacts(tenant_id, updated_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(tenant_id, phone);
-    CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_verifications(phone, expires_at);
-  `);
+    // Indexes
+    `CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);`,
+    `CREATE INDEX IF NOT EXISTS idx_messages_meta_id ON messages(meta_message_id);`,
+    `CREATE INDEX IF NOT EXISTS idx_channels_phone_id ON whatsapp_channels(phone_number_id);`,
+    `CREATE INDEX IF NOT EXISTS idx_channels_waba_id ON whatsapp_channels(waba_id);`,
+    `CREATE INDEX IF NOT EXISTS idx_channels_tenant ON whatsapp_channels(tenant_id);`,
+    `CREATE INDEX IF NOT EXISTS idx_conv_tenant ON conversations(tenant_id, updated_at DESC);`,
+    `CREATE INDEX IF NOT EXISTS idx_contacts_tenant ON contacts(tenant_id, updated_at DESC);`,
+    `CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(tenant_id, phone);`,
+    `CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_verifications(phone, expires_at);`,
+    `CREATE INDEX IF NOT EXISTS idx_users_mobile ON users(mobile);`
+  ];
 
-  // Safe schema migrations for existing database files
-  try { db.exec("ALTER TABLE users ADD COLUMN mobile TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE users ADD COLUMN phone_verified INTEGER DEFAULT 0;"); } catch (_) {}
-  try { db.exec("CREATE INDEX IF NOT EXISTS idx_users_mobile ON users(mobile);"); } catch (_) {}
-  try { db.exec("ALTER TABLE plans ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR';"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN legal_business_name TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN business_type TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN gstin TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN pan TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN registered_address TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN state TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN pincode TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN billing_contact TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN billing_contact_name TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN billing_contact_phone TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE tenants ADD COLUMN billing_contact_email TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE conversations ADD COLUMN assigned_to_user_id TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE conversations ADD COLUMN internal_notes TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE conversations ADD COLUMN tags TEXT;"); } catch (_) {}
-  try { db.exec("ALTER TABLE conversations ADD COLUMN status TEXT DEFAULT 'open';"); } catch (_) {}
+  for (const ddl of ddlStatements) {
+    try {
+      await db.exec(ddl);
+    } catch (err: any) {
+      console.warn('[Database] DDL notice:', err?.message || err);
+    }
+  }
 
-  seedDefaultData();
+  // Safe schema migrations for existing columns
+  const migrationColumns = [
+    { table: 'users', col: 'mobile', type: 'TEXT' },
+    { table: 'users', col: 'phone_verified', type: 'INTEGER DEFAULT 0' },
+    { table: 'plans', col: 'currency', type: "TEXT NOT NULL DEFAULT 'INR'" },
+    { table: 'tenants', col: 'legal_business_name', type: 'TEXT' },
+    { table: 'tenants', col: 'business_type', type: 'TEXT' },
+    { table: 'tenants', col: 'gstin', type: 'TEXT' },
+    { table: 'tenants', col: 'pan', type: 'TEXT' },
+    { table: 'tenants', col: 'registered_address', type: 'TEXT' },
+    { table: 'tenants', col: 'state', type: 'TEXT' },
+    { table: 'tenants', col: 'pincode', type: 'TEXT' },
+    { table: 'tenants', col: 'billing_contact', type: 'TEXT' },
+    { table: 'tenants', col: 'billing_contact_name', type: 'TEXT' },
+    { table: 'tenants', col: 'billing_contact_phone', type: 'TEXT' },
+    { table: 'tenants', col: 'billing_contact_email', type: 'TEXT' },
+    { table: 'conversations', col: 'assigned_to_user_id', type: 'TEXT' },
+    { table: 'conversations', col: 'internal_notes', type: 'TEXT' },
+    { table: 'conversations', col: 'tags', type: 'TEXT' },
+    { table: 'conversations', col: 'status', type: "TEXT DEFAULT 'open'" },
+  ];
+
+  for (const m of migrationColumns) {
+    try {
+      const sql = isPostgres
+        ? `ALTER TABLE ${m.table} ADD COLUMN IF NOT EXISTS ${m.col} ${m.type};`
+        : `ALTER TABLE ${m.table} ADD COLUMN ${m.col} ${m.type};`;
+      await db.exec(sql);
+    } catch (_) {}
+  }
+
+  await seedDefaultData();
+  console.log('[Database] Schema initialization and seeding complete.');
 }
 
-function seedDefaultData() {
+async function seedDefaultData() {
   const now = Date.now();
 
-  // 1. Seed or Update INR Indian Market Plans (Prompt2 specs)
-  const upsertPlan = db.prepare(`
+  // 1. Seed or Update INR Indian Market Plans
+  const upsertPlanSql = `
     INSERT INTO plans (id, name, slug, price_monthly, price_yearly, currency, max_whatsapp_numbers, max_team_members, monthly_message_quota, coexistence_allowed, campaigns_allowed, is_active, created_at)
     VALUES (?, ?, ?, ?, ?, 'INR', ?, ?, ?, ?, ?, 1, ?)
     ON CONFLICT(id) DO UPDATE SET
@@ -313,41 +420,41 @@ function seedDefaultData() {
       max_whatsapp_numbers = excluded.max_whatsapp_numbers,
       max_team_members = excluded.max_team_members,
       monthly_message_quota = excluded.monthly_message_quota
-  `);
+  `;
 
-  upsertPlan.run('plan_starter', 'Starter', 'starter', 999, 9990, 1, 2, 5000, 1, 1, now);
-  upsertPlan.run('plan_growth', 'Growth', 'growth', 2499, 24990, 3, 10, 30000, 1, 1, now);
-  upsertPlan.run('plan_pro', 'Pro', 'pro', 4999, 49990, 5, 25, 100000, 1, 1, now);
-  upsertPlan.run('plan_enterprise', 'Enterprise', 'enterprise', 0, 0, 10, 50, 500000, 1, 1, now);
+  await db.prepare(upsertPlanSql).run('plan_starter', 'Starter', 'starter', 999, 9990, 1, 2, 5000, 1, 1, now);
+  await db.prepare(upsertPlanSql).run('plan_growth', 'Growth', 'growth', 2499, 24990, 3, 10, 30000, 1, 1, now);
+  await db.prepare(upsertPlanSql).run('plan_pro', 'Pro', 'pro', 4999, 49990, 5, 25, 100000, 1, 1, now);
+  await db.prepare(upsertPlanSql).run('plan_enterprise', 'Enterprise', 'enterprise', 0, 0, 10, 50, 500000, 1, 1, now);
 
   // Seed Default Discount Coupons
-  const couponCheck = db.prepare('SELECT count(*) as count FROM coupons').get() as { count: number | bigint };
+  const couponCheck = await db.prepare('SELECT count(*) as count FROM coupons').get() as { count: number | bigint | string } | undefined;
   if (!couponCheck || Number(couponCheck.count) === 0) {
-    db.prepare('INSERT INTO coupons (id, code, discount_percent, max_uses, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)').run(uuidv4(), 'WELCOME50', 50, 500, now);
-    db.prepare('INSERT INTO coupons (id, code, discount_percent, max_uses, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)').run(uuidv4(), 'STARTUP20', 20, 1000, now);
+    await db.prepare('INSERT INTO coupons (id, code, discount_percent, max_uses, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)').run(uuidv4(), 'WELCOME50', 50, 500, now);
+    await db.prepare('INSERT INTO coupons (id, code, discount_percent, max_uses, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)').run(uuidv4(), 'STARTUP20', 20, 1000, now);
   }
 
   // 2. Seed Default Super Admin
-  const adminCheck = db.prepare("SELECT id FROM users WHERE role = 'super_admin'").get();
+  const adminCheck = await db.prepare("SELECT id FROM users WHERE role = 'super_admin'").get();
   if (!adminCheck) {
     const defaultAdminHash = bcrypt.hashSync('Admin@12345', 10);
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO users (id, tenant_id, email, password_hash, name, role, created_at)
       VALUES (?, NULL, ?, ?, ?, 'super_admin', ?)
     `).run(uuidv4(), 'admin@whatchat.online', defaultAdminHash, 'Platform Super Admin', now);
   }
 
   // 3. Seed Default / Demo Tenant for backward compatibility
-  const defaultTenantCheck = db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace'").get();
-  let defaultTenantId = 'tenant_default_01';
+  const defaultTenantCheck = await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace'").get();
+  const defaultTenantId = 'tenant_default_01';
   if (!defaultTenantCheck) {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO tenants (id, name, slug, plan_id, subscription_status, monthly_message_quota, messages_used_current_cycle, created_at)
       VALUES (?, ?, 'default-workspace', 'plan_growth', 'active', 50000, 0, ?)
     `).run(defaultTenantId, 'Default Workspace', now);
 
     const defaultOwnerHash = bcrypt.hashSync('Owner@12345', 10);
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO users (id, tenant_id, email, password_hash, name, role, created_at)
       VALUES (?, ?, ?, ?, ?, 'tenant_owner', ?)
     `).run(uuidv4(), defaultTenantId, 'owner@example.com', defaultOwnerHash, 'Workspace Owner', now);
@@ -359,9 +466,9 @@ function seedDefaultData() {
     if (fs.existsSync(credsFile)) {
       const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
       if (creds.phoneNumberId && creds.accessToken) {
-        const existingChannel = db.prepare('SELECT id FROM whatsapp_channels WHERE phone_number_id = ?').get(creds.phoneNumberId);
+        const existingChannel = await db.prepare('SELECT id FROM whatsapp_channels WHERE phone_number_id = ?').get(creds.phoneNumberId);
         if (!existingChannel) {
-          db.prepare(`
+          await db.prepare(`
             INSERT INTO whatsapp_channels (id, tenant_id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, access_token, app_id, app_secret, coexistence_enabled, webhook_verify_token, status, connected_at, updated_at)
             VALUES (?, ?, 'byo_meta', ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?)
           `).run(
@@ -382,6 +489,6 @@ function seedDefaultData() {
       }
     }
   } catch (err) {
-    console.warn('[DB Seed] Legacy credentials migration skipped:', err);
+    console.warn('[DB Seed] Legacy credentials migration notice:', err);
   }
 }

@@ -65,12 +65,12 @@ setInterval(() => {
 }, 20000);
 
 // Resolve which tenant owns an incoming webhook event
-export function resolveTenantFromWebhook(wabaId?: string, phoneNumberId?: string): {
+export async function resolveTenantFromWebhook(wabaId?: string, phoneNumberId?: string): Promise<{
   tenantId: string;
   channelId: string;
-} | null {
+} | null> {
   if (phoneNumberId) {
-    const channel = db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE phone_number_id = ?').get(phoneNumberId) as {
+    const channel = (await db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE phone_number_id = ?').get(phoneNumberId)) as {
       id: string;
       tenant_id: string;
     } | undefined;
@@ -78,7 +78,7 @@ export function resolveTenantFromWebhook(wabaId?: string, phoneNumberId?: string
   }
 
   if (wabaId) {
-    const channel = db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE waba_id = ?').get(wabaId) as {
+    const channel = (await db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE waba_id = ?').get(wabaId)) as {
       id: string;
       tenant_id: string;
     } | undefined;
@@ -86,7 +86,7 @@ export function resolveTenantFromWebhook(wabaId?: string, phoneNumberId?: string
   }
 
   // Fallback to default demo tenant if single channel exists
-  const defaultChannel = db.prepare('SELECT id, tenant_id FROM whatsapp_channels LIMIT 1').get() as {
+  const defaultChannel = (await db.prepare('SELECT id, tenant_id FROM whatsapp_channels LIMIT 1').get()) as {
     id: string;
     tenant_id: string;
   } | undefined;
@@ -99,7 +99,7 @@ export function resolveTenantFromWebhook(wabaId?: string, phoneNumberId?: string
 }
 
 // Ingest incoming webhook payload, persist to DB with tenant scoping, and trigger isolated SSE push
-export function processInboundWebhookPayload(body: any) {
+export async function processInboundWebhookPayload(body: any): Promise<void> {
   if (body?.object !== 'whatsapp_business_account') return;
 
   const entries = body.entry || [];
@@ -112,7 +112,7 @@ export function processInboundWebhookPayload(body: any) {
       if (!value) continue;
 
       const phoneNumberId = value.metadata?.phone_number_id;
-      const tenantMatch = resolveTenantFromWebhook(wabaId, phoneNumberId);
+      const tenantMatch = await resolveTenantFromWebhook(wabaId, phoneNumberId);
 
       if (!tenantMatch) {
         console.warn(`[Webhook Router] Unmapped inbound event for WABA ${wabaId} / Phone ${phoneNumberId}. Skipping.`);
@@ -164,14 +164,14 @@ export function processInboundWebhookPayload(body: any) {
           }
 
           // Atomically upsert conversation
-          let conv = db.prepare('SELECT id, unread_count FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, senderPhone) as {
+          let conv = (await db.prepare('SELECT id, unread_count FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, senderPhone)) as {
             id: string;
             unread_count: number;
           } | undefined;
 
           let convId = conv ? conv.id : uuidv4();
           if (conv) {
-            db.prepare(`
+            await db.prepare(`
               UPDATE conversations
               SET customer_name = COALESCE(?, customer_name),
                   unread_count = unread_count + 1,
@@ -182,16 +182,16 @@ export function processInboundWebhookPayload(body: any) {
           } else {
             const colors = ['#008069', '#128C7E', '#25D366', '#075E54', '#34B7F1'];
             const randomColor = colors[Math.floor(Math.random() * colors.length)];
-            db.prepare(`
+            await db.prepare(`
               INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
               VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             `).run(convId, tenantId, channelId, senderPhone, senderName, randomColor, textContent, msgTimestamp, msgTimestamp);
           }
 
           // Insert Message
-          const existingMsg = db.prepare('SELECT id FROM messages WHERE meta_message_id = ?').get(msgId);
+          const existingMsg = await db.prepare('SELECT id FROM messages WHERE meta_message_id = ?').get(msgId);
           if (!existingMsg) {
-            db.prepare(`
+            await db.prepare(`
               INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, location_json, status, created_at)
               VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 'read', ?)
             `).run(uuidv4(), tenantId, convId, msgId, msg.type, textContent, mediaUrl, mediaCaption, filename, locationJson, msgTimestamp);
@@ -219,7 +219,7 @@ export function processInboundWebhookPayload(body: any) {
           const statusTimestamp = parseInt(status.timestamp || '0', 10) * 1000 || Date.now();
 
           // Update message status in DB
-          db.prepare(`
+          await db.prepare(`
             UPDATE messages
             SET status = ?
             WHERE meta_message_id = ? AND tenant_id = ?

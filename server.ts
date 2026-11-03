@@ -128,9 +128,6 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// Initialize Multi-Tenant SaaS Relational Database
-initDatabase();
-
 // Mount SaaS Multi-Tenant API Router
 app.use('/api', saasRouter);
 
@@ -666,11 +663,9 @@ app.post(WEBHOOK_PATHS, (req: any, res) => {
 
     if (body?.object === 'whatsapp_business_account') {
       // Multi-tenant database routing & isolated tenant SSE broadcast
-      try {
-        processInboundWebhookPayload(body);
-      } catch (routingErr) {
+      processInboundWebhookPayload(body).catch((routingErr) => {
         console.error('[MultiTenant Webhook Routing Error]:', routingErr);
-      }
+      });
 
       const entries = body.entry || [];
       for (const entry of entries) {
@@ -1115,6 +1110,9 @@ app.post('/api/whatsapp/test-webhook', async (req, res) => {
 
 // Start dev server with Vite middlewares or static files
 async function startServer() {
+  // Initialize Database (PostgreSQL if DATABASE_URL is set, else SQLite)
+  await initDatabase();
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

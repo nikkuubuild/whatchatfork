@@ -68,9 +68,9 @@ export function verifyAdminToken(token: string): AuthUser | null {
 }
 
 // Rate Limiting on Login Attempts
-export function checkLoginAttempts(key: string): { allowed: boolean; remainingLockSeconds?: number } {
+export async function checkLoginAttempts(key: string): Promise<{ allowed: boolean; remainingLockSeconds?: number }> {
   const now = Date.now();
-  const record = db.prepare('SELECT attempts, locked_until FROM login_attempts WHERE key = ?').get(key) as {
+  const record = (await db.prepare('SELECT attempts, locked_until FROM login_attempts WHERE key = ?').get(key)) as {
     attempts: number;
     locked_until: number;
   } | undefined;
@@ -81,25 +81,25 @@ export function checkLoginAttempts(key: string): { allowed: boolean; remainingLo
   return { allowed: true };
 }
 
-export function recordFailedLogin(key: string) {
+export async function recordFailedLogin(key: string): Promise<void> {
   const now = Date.now();
-  const record = db.prepare('SELECT attempts FROM login_attempts WHERE key = ?').get(key) as { attempts: number } | undefined;
+  const record = (await db.prepare('SELECT attempts FROM login_attempts WHERE key = ?').get(key)) as { attempts: number } | undefined;
   const attempts = (record?.attempts || 0) + 1;
   const lockedUntil = attempts >= 5 ? now + 15 * 60 * 1000 : 0; // Lock 15 mins after 5 failures
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO login_attempts (key, attempts, locked_until, last_attempt)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET attempts = excluded.attempts, locked_until = excluded.locked_until, last_attempt = excluded.last_attempt
   `).run(key, attempts, lockedUntil, now);
 }
 
-export function resetLoginAttempts(key: string) {
-  db.prepare('DELETE FROM login_attempts WHERE key = ?').run(key);
+export async function resetLoginAttempts(key: string): Promise<void> {
+  await db.prepare('DELETE FROM login_attempts WHERE key = ?').run(key);
 }
 
 // Super Admin Audit Logging
-export function logAdminAction(params: {
+export async function logAdminAction(params: {
   adminId: string;
   adminEmail: string;
   action: string;
@@ -107,7 +107,7 @@ export function logAdminAction(params: {
   details?: string;
   ipAddress?: string;
 }) {
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO admin_audit_logs (id, admin_id, admin_email, action, target_id, details, ip_address, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -123,7 +123,7 @@ export function logAdminAction(params: {
 }
 
 // Middleware: Authenticate request via Bearer token or query parameter (for SSE)
-export function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
   const queryToken = req.query.token as string | undefined;
 
@@ -137,7 +137,7 @@ export function authenticateToken(req: AuthenticatedRequest, res: Response, next
   if (!token) {
     // Explicit guest/demo access only when explicitly requested
     if (req.query.demo === 'true') {
-      const defaultTenant = db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace'").get() as { id: string } | undefined;
+      const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace'").get()) as { id: string } | undefined;
       if (defaultTenant) {
         req.user = {
           id: 'user_default',
@@ -167,7 +167,7 @@ export function authenticateToken(req: AuthenticatedRequest, res: Response, next
 }
 
 // Middleware: Strict Super Admin Authorization
-export function requireSuperAdminAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function requireSuperAdminAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, error: 'Super Admin credentials required.' });
@@ -178,7 +178,7 @@ export function requireSuperAdminAuth(req: AuthenticatedRequest, res: Response, 
     return res.status(403).json({ success: false, error: 'Access denied: Super Admin privilege required.' });
   }
 
-  const user = db.prepare("SELECT id, email, role FROM users WHERE id = ? AND role = 'super_admin'").get(payload.id);
+  const user = await db.prepare("SELECT id, email, role FROM users WHERE id = ? AND role = 'super_admin'").get(payload.id);
   if (!user) {
     return res.status(403).json({ success: false, error: 'Super Admin account no longer active.' });
   }
@@ -219,13 +219,13 @@ export function requireSuperAdmin(req: AuthenticatedRequest, res: Response, next
 }
 
 // Middleware: Check and enforce tenant message quota before dispatching
-export function checkMessageQuota(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function checkMessageQuota(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const tenantId = req.tenantId;
   if (!tenantId) {
     return res.status(400).json({ success: false, error: 'Tenant context required' });
   }
 
-  const tenant = db.prepare('SELECT subscription_status, monthly_message_quota, messages_used_current_cycle FROM tenants WHERE id = ?').get(tenantId) as {
+  const tenant = (await db.prepare('SELECT subscription_status, monthly_message_quota, messages_used_current_cycle FROM tenants WHERE id = ?').get(tenantId)) as {
     subscription_status: string;
     monthly_message_quota: number;
     messages_used_current_cycle: number;

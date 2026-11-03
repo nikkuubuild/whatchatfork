@@ -12,25 +12,25 @@ export interface PlatformMetaConfig {
 }
 
 // Retrieve platform-wide shared Meta app credentials (Super Admin managed)
-export function getPlatformMetaConfig(): PlatformMetaConfig {
-  const getVal = (key: string, fallback: string = ''): string => {
-    const row = db.prepare('SELECT value FROM platform_config WHERE key = ?').get(key) as { value: string } | undefined;
+export async function getPlatformMetaConfig(): Promise<PlatformMetaConfig> {
+  const getVal = async (key: string, fallback: string = ''): Promise<string> => {
+    const row = (await db.prepare('SELECT value FROM platform_config WHERE key = ?').get(key)) as { value: string } | undefined;
     return row ? row.value : fallback;
   };
 
   return {
-    appId: getVal('meta_app_id', process.env.WHATSAPP_APP_ID || ''),
-    appSecret: getVal('meta_app_secret', process.env.WHATSAPP_APP_SECRET || ''),
-    configId: getVal('meta_config_id', process.env.WHATSAPP_CONFIG_ID || ''),
-    partnerSolutionId: getVal('partner_solution_id', process.env.WHATSAPP_SOLUTION_ID || ''),
-    webhookVerifyToken: getVal('webhook_verify_token', process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token'),
-    coexistenceEnabled: getVal('coexistence_enabled', '1') === '1',
-    graphVersion: getVal('graph_version', 'v21.0')
+    appId: await getVal('meta_app_id', process.env.WHATSAPP_APP_ID || ''),
+    appSecret: await getVal('meta_app_secret', process.env.WHATSAPP_APP_SECRET || ''),
+    configId: await getVal('meta_config_id', process.env.WHATSAPP_CONFIG_ID || ''),
+    partnerSolutionId: await getVal('partner_solution_id', process.env.WHATSAPP_SOLUTION_ID || ''),
+    webhookVerifyToken: await getVal('webhook_verify_token', process.env.WHATSAPP_VERIFY_TOKEN || 'whatscloud_token'),
+    coexistenceEnabled: (await getVal('coexistence_enabled', '1')) === '1',
+    graphVersion: await getVal('graph_version', 'v21.0')
   };
 }
 
 // Save platform-wide shared Meta app credentials
-export function savePlatformMetaConfig(config: Partial<PlatformMetaConfig>) {
+export async function savePlatformMetaConfig(config: Partial<PlatformMetaConfig>) {
   const now = Date.now();
   const upsert = db.prepare(`
     INSERT INTO platform_config (key, value, updated_at)
@@ -38,13 +38,13 @@ export function savePlatformMetaConfig(config: Partial<PlatformMetaConfig>) {
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `);
 
-  if (config.appId !== undefined) upsert.run('meta_app_id', config.appId.trim(), now);
-  if (config.appSecret !== undefined) upsert.run('meta_app_secret', config.appSecret.trim(), now);
-  if (config.configId !== undefined) upsert.run('meta_config_id', config.configId.trim(), now);
-  if (config.partnerSolutionId !== undefined) upsert.run('partner_solution_id', config.partnerSolutionId.trim(), now);
-  if (config.webhookVerifyToken !== undefined) upsert.run('webhook_verify_token', config.webhookVerifyToken.trim(), now);
-  if (config.coexistenceEnabled !== undefined) upsert.run('coexistence_enabled', config.coexistenceEnabled ? '1' : '0', now);
-  if (config.graphVersion !== undefined) upsert.run('graph_version', config.graphVersion.trim(), now);
+  if (config.appId !== undefined) await upsert.run('meta_app_id', config.appId.trim(), now);
+  if (config.appSecret !== undefined) await upsert.run('meta_app_secret', config.appSecret.trim(), now);
+  if (config.configId !== undefined) await upsert.run('meta_config_id', config.configId.trim(), now);
+  if (config.partnerSolutionId !== undefined) await upsert.run('partner_solution_id', config.partnerSolutionId.trim(), now);
+  if (config.webhookVerifyToken !== undefined) await upsert.run('webhook_verify_token', config.webhookVerifyToken.trim(), now);
+  if (config.coexistenceEnabled !== undefined) await upsert.run('coexistence_enabled', config.coexistenceEnabled ? '1' : '0', now);
+  if (config.graphVersion !== undefined) await upsert.run('graph_version', config.graphVersion.trim(), now);
 }
 
 // Onboarding Method A: Bring Your Own Meta App (BYO)
@@ -76,7 +76,7 @@ export async function connectByoMetaChannel(params: {
   const now = Date.now();
 
   // Check if channel already exists for this phone number
-  const existing = db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE phone_number_id = ?').get(cleanPhoneId) as { id: string; tenant_id: string } | undefined;
+  const existing = (await db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE phone_number_id = ?').get(cleanPhoneId)) as { id: string; tenant_id: string } | undefined;
 
   if (existing && existing.tenant_id !== tenantId) {
     throw new Error('This WhatsApp Phone Number is already connected to another workspace.');
@@ -84,7 +84,7 @@ export async function connectByoMetaChannel(params: {
 
   const channelId = existing ? existing.id : uuidv4();
   if (existing) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE whatsapp_channels
       SET connection_mode = 'byo_meta',
           waba_id = ?,
@@ -109,7 +109,7 @@ export async function connectByoMetaChannel(params: {
       channelId
     );
   } else {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO whatsapp_channels (id, tenant_id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, access_token, app_id, app_secret, coexistence_enabled, webhook_verify_token, status, connected_at, updated_at)
       VALUES (?, ?, 'byo_meta', ?, ?, ?, ?, ?, ?, ?, ?, 'whatscloud_token', 'active', ?, ?)
     `).run(
@@ -160,7 +160,7 @@ export async function completeEmbeddedSignup(params: {
   coexistenceEnabled?: boolean;
 }) {
   const { tenantId, code, wabaId, phoneNumberId, coexistenceEnabled } = params;
-  const platformConfig = getPlatformMetaConfig();
+  const platformConfig = await getPlatformMetaConfig();
 
   if (!platformConfig.appId || !platformConfig.appSecret) {
     throw new Error('Platform Meta App ID and App Secret are not configured. Please contact Super Admin.');
@@ -228,7 +228,7 @@ export async function completeEmbeddedSignup(params: {
   }
 
   // Step 4: Save the connection against the tenant in the database
-  const existing = db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE phone_number_id = ?').get(targetPhoneId) as { id: string; tenant_id: string } | undefined;
+  const existing = (await db.prepare('SELECT id, tenant_id FROM whatsapp_channels WHERE phone_number_id = ?').get(targetPhoneId)) as { id: string; tenant_id: string } | undefined;
 
   if (existing && existing.tenant_id !== tenantId) {
     throw new Error('This phone number is already attached to another workspace.');
@@ -236,7 +236,7 @@ export async function completeEmbeddedSignup(params: {
 
   const channelId = existing ? existing.id : uuidv4();
   if (existing) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE whatsapp_channels
       SET connection_mode = 'embedded_signup',
           waba_id = ?,
@@ -257,7 +257,7 @@ export async function completeEmbeddedSignup(params: {
       channelId
     );
   } else {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO whatsapp_channels (id, tenant_id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, access_token, coexistence_enabled, webhook_verify_token, status, connected_at, updated_at)
       VALUES (?, ?, 'embedded_signup', ?, ?, ?, ?, ?, ?, 'whatscloud_token', 'active', ?, ?)
     `).run(
@@ -291,7 +291,6 @@ async function autoSubscribeWaba(params: {
   wabaId: string;
   accessToken: string;
 }) {
-  const appAccessToken = `${params.appId}|${params.appSecret}`;
   await fetch(
     `https://graph.facebook.com/v21.0/${params.wabaId}/subscribed_apps`,
     {

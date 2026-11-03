@@ -50,13 +50,13 @@ export function normalizePhoneNumber(rawPhone: string): string | null {
  * - Max 4 requests per 10 minutes per phone
  * - Max 15 requests per hour per IP
  */
-export function checkOtpRateLimit(phone: string, ip: string): RateLimitResult {
+export async function checkOtpRateLimit(phone: string, ip: string): Promise<RateLimitResult> {
   const now = Date.now();
   const phoneKey = `phone:${phone}`;
   const ipKey = `ip:${ip || '127.0.0.1'}`;
 
   // 1. Phone Cooldown & Window Check
-  const phoneLimit = db.prepare('SELECT requests_count, window_start, last_request FROM otp_rate_limits WHERE key = ?').get(phoneKey) as {
+  const phoneLimit = (await db.prepare('SELECT requests_count, window_start, last_request FROM otp_rate_limits WHERE key = ?').get(phoneKey)) as {
     requests_count: number;
     window_start: number;
     last_request: number;
@@ -87,7 +87,7 @@ export function checkOtpRateLimit(phone: string, ip: string): RateLimitResult {
   }
 
   // 2. IP Window Check (1 hour sliding window)
-  const ipLimit = db.prepare('SELECT requests_count, window_start FROM otp_rate_limits WHERE key = ?').get(ipKey) as {
+  const ipLimit = (await db.prepare('SELECT requests_count, window_start FROM otp_rate_limits WHERE key = ?').get(ipKey)) as {
     requests_count: number;
     window_start: number;
   } | undefined;
@@ -107,25 +107,25 @@ export function checkOtpRateLimit(phone: string, ip: string): RateLimitResult {
 /**
  * Record an OTP request in the rate limit table
  */
-export function recordOtpRequest(phone: string, ip: string) {
+export async function recordOtpRequest(phone: string, ip: string): Promise<void> {
   const now = Date.now();
   const phoneKey = `phone:${phone}`;
   const ipKey = `ip:${ip || '127.0.0.1'}`;
 
   // Record for phone
-  const phoneLimit = db.prepare('SELECT requests_count, window_start FROM otp_rate_limits WHERE key = ?').get(phoneKey) as {
+  const phoneLimit = (await db.prepare('SELECT requests_count, window_start FROM otp_rate_limits WHERE key = ?').get(phoneKey)) as {
     requests_count: number;
     window_start: number;
   } | undefined;
 
   if (phoneLimit && now - phoneLimit.window_start < 10 * 60 * 1000) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE otp_rate_limits
       SET requests_count = requests_count + 1, last_request = ?
       WHERE key = ?
     `).run(now, phoneKey);
   } else {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO otp_rate_limits (key, requests_count, window_start, last_request)
       VALUES (?, 1, ?, ?)
       ON CONFLICT(key) DO UPDATE SET requests_count = 1, window_start = excluded.window_start, last_request = excluded.last_request
@@ -133,19 +133,19 @@ export function recordOtpRequest(phone: string, ip: string) {
   }
 
   // Record for IP
-  const ipLimit = db.prepare('SELECT requests_count, window_start FROM otp_rate_limits WHERE key = ?').get(ipKey) as {
+  const ipLimit = (await db.prepare('SELECT requests_count, window_start FROM otp_rate_limits WHERE key = ?').get(ipKey)) as {
     requests_count: number;
     window_start: number;
   } | undefined;
 
   if (ipLimit && now - ipLimit.window_start < 60 * 60 * 1000) {
-    db.prepare(`
+    await db.prepare(`
       UPDATE otp_rate_limits
       SET requests_count = requests_count + 1, last_request = ?
       WHERE key = ?
     `).run(now, ipKey);
   } else {
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO otp_rate_limits (key, requests_count, window_start, last_request)
       VALUES (?, 1, ?, ?)
       ON CONFLICT(key) DO UPDATE SET requests_count = 1, window_start = excluded.window_start, last_request = excluded.last_request
@@ -160,13 +160,13 @@ export function recordOtpRequest(phone: string, ip: string) {
 async function dispatchWhatsAppMessage(toPhone: string, otpCode: string, recipientName: string): Promise<boolean> {
   try {
     // 1. Search for active WhatsApp channel in database
-    const channel = db.prepare(`
+    const channel = (await db.prepare(`
       SELECT phone_number_id, access_token
       FROM whatsapp_channels
       WHERE status = 'active' AND access_token IS NOT NULL AND phone_number_id IS NOT NULL
       ORDER BY connected_at DESC
       LIMIT 1
-    `).get() as { phone_number_id: string; access_token: string } | undefined;
+    `).get()) as { phone_number_id: string; access_token: string } | undefined;
 
     let phoneId = channel?.phone_number_id || process.env.WHATSAPP_PHONE_NUMBER_ID;
     let token = channel?.access_token || process.env.WHATSAPP_ACCESS_TOKEN;
@@ -227,7 +227,7 @@ export async function createAndSendWhatsAppOtp(params: {
   }
 
   // Rate limit check
-  const rateLimit = checkOtpRateLimit(normalized, ip);
+  const rateLimit = await checkOtpRateLimit(normalized, ip);
   if (!rateLimit.allowed) {
     return {
       success: false,
@@ -244,20 +244,20 @@ export async function createAndSendWhatsAppOtp(params: {
   const expiresAt = now + 10 * 60 * 1000; // 10 minutes
 
   // Invalidate any prior pending unverified codes for this phone
-  db.prepare(`
+  await db.prepare(`
     UPDATE otp_verifications
     SET verified = -1
     WHERE phone = ? AND verified = 0
   `).run(normalized);
 
   // Insert new verification record
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO otp_verifications (id, phone, otp_hash, otp_plain, purpose, attempts, max_attempts, verified, expires_at, created_at)
     VALUES (?, ?, ?, ?, ?, 0, 5, 0, ?, ?)
   `).run(uuidv4(), normalized, otpHmac, otpCode, purpose, expiresAt, now);
 
   // Record rate limit hit
-  recordOtpRequest(normalized, ip);
+  await recordOtpRequest(normalized, ip);
 
   // Dispatch via WhatsApp Cloud API
   const liveSent = await dispatchWhatsAppMessage(normalized, otpCode, name);
@@ -278,7 +278,7 @@ export async function createAndSendWhatsAppOtp(params: {
 /**
  * Verifies an entered OTP for a given mobile number
  */
-export function verifyWhatsAppOtp(mobile: string, enteredOtp: string, purpose: string = 'registration'): VerifyOtpResult {
+export async function verifyWhatsAppOtp(mobile: string, enteredOtp: string, purpose: string = 'registration'): Promise<VerifyOtpResult> {
   const normalized = normalizePhoneNumber(mobile);
   if (!normalized) {
     return { success: false, error: 'Invalid mobile number.' };
@@ -291,13 +291,13 @@ export function verifyWhatsAppOtp(mobile: string, enteredOtp: string, purpose: s
   const cleanOtp = enteredOtp.trim();
   const now = Date.now();
 
-  const record = db.prepare(`
+  const record = (await db.prepare(`
     SELECT id, otp_hash, otp_plain, attempts, max_attempts, expires_at
     FROM otp_verifications
     WHERE phone = ? AND purpose = ? AND verified = 0
     ORDER BY created_at DESC
     LIMIT 1
-  `).get(normalized, purpose) as {
+  `).get(normalized, purpose)) as {
     id: string;
     otp_hash: string;
     otp_plain: string;
@@ -329,7 +329,7 @@ export function verifyWhatsAppOtp(mobile: string, enteredOtp: string, purpose: s
 
   // Increment attempts counter
   const newAttempts = record.attempts + 1;
-  db.prepare('UPDATE otp_verifications SET attempts = ? WHERE id = ?').run(newAttempts, record.id);
+  await db.prepare('UPDATE otp_verifications SET attempts = ? WHERE id = ?').run(newAttempts, record.id);
 
   // Verify hash
   const candidateHash = crypto.createHmac('sha256', 'whatchat_otp_salt_2026').update(cleanOtp).digest('hex');
@@ -347,7 +347,7 @@ export function verifyWhatsAppOtp(mobile: string, enteredOtp: string, purpose: s
   }
 
   // Mark verified
-  db.prepare('UPDATE otp_verifications SET verified = 1 WHERE id = ?').run(record.id);
+  await db.prepare('UPDATE otp_verifications SET verified = 1 WHERE id = ?').run(record.id);
 
   return { success: true };
 }
