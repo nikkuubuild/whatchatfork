@@ -20,3 +20,9 @@ services:
         fromDatabase:
           name: whatchat-db
           property: connectionString
+      - key: APP_BASE_URL
+        value: https://whatchatfork.onrender.com
+      - key: WHATSAPP_WEBHOOK_PATH
+        value: /api/whatsapp/webhook
+      - key: WHATSAPP_VERIFY_TOKEN
+        value: whatchat_webhook_secret_2026
