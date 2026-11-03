@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --wa-green: #008069;
+    --wa-green-dark: #005c4b;
+    --wa-light-bg: #efeae2;
+    --wa-dark-bg: #0b141a;
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* Authentic WhatsApp chat doodle wallpaper subtly rendered in CSS SVG */
+.whatsapp-chat-bg-light {
+  background-color: #efeae2;
+  background-image: radial-gradient(#d8d2cb 0.75px, transparent 0.75px), radial-gradient(#d8d2cb 0.75px, #efeae2 0.75px);
+  background-size: 30px 30px;
+  background-position: 0 0, 15px 15px;
+}
+
+.whatsapp-chat-bg-dark {
+  background-color: #0b141a;
+  background-image: radial-gradient(#15202b 0.75px, transparent 0.75px), radial-gradient(#15202b 0.75px, #0b141a 0.75px);
+  background-size: 30px 30px;
+  background-position: 0 0, 15px 15px;
+}
+
+/* Custom mobile-smooth scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(150, 150, 150, 0.25);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(150, 150, 150, 0.45);
+}

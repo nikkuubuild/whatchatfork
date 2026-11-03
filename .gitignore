@@ -1,0 +1,18 @@
+node_modules/
+build/
+dist/
+dev-dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Binaries and local tunnels
+bin/
+
+# Local databases
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.json

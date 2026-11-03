@@ -1,0 +1,6 @@
+{
+  "name": "WhatsCloud - WhatsApp Broadcast & Chat",
+  "description": "Lightweight Android-native WhatsApp Cloud API client for bulk messaging, Meta template management, and unified rich media customer chatting.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

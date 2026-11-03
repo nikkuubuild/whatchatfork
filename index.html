@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>WhatsCloud - WhatsApp Broadcast & Chat</title>
+    <script>
+      // Suppress Vite dev WebSocket disconnect errors in proxy environments without WebSocket support
+      window.addEventListener('error', function(event) {
+        if (event && event.message && (
+          event.message.includes('WebSocket') ||
+          event.message.includes('@vite/client') ||
+          event.message.includes('[vite]')
+        )) {
+          event.stopImmediatePropagation();
+          event.preventDefault();
+        }
+      }, true);
+      window.addEventListener('unhandledrejection', function(event) {
+        if (event && event.reason && (String(event.reason).includes('WebSocket') || String(event.reason?.message).includes('WebSocket'))) {
+          event.stopImmediatePropagation();
+          event.preventDefault();
+        }
+      }, true);
+    </script>
+    <meta name="description" content="Lightweight Android-native WhatsApp Cloud API client for bulk messaging, Meta template management, and unified rich media customer chatting." />
+    <meta property="og:title" content="WhatsCloud - WhatsApp Broadcast & Chat" />
+    <meta property="og:description" content="Lightweight Android-native WhatsApp Cloud API client for bulk messaging, Meta template management, and unified rich media customer chatting." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#008069" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="WhatsCloud" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-slate-100 dark:bg-slate-950 font-sans antialiased select-none text-slate-900 dark:text-slate-100 overflow-x-hidden">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
