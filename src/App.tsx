@@ -121,6 +121,50 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // Synchronize full chat history and conversations from server database on mount and login
+  useEffect(() => {
+    const syncHeaders: Record<string, string> = saasToken ? { Authorization: `Bearer ${saasToken}` } : {};
+    fetch(saasToken ? `/api/chats/sync?token=${encodeURIComponent(saasToken)}` : '/api/chats/sync', {
+      headers: syncHeaders
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.success) {
+          if (Array.isArray(data.conversations) && data.conversations.length > 0) {
+            setConversations((prev) => {
+              const mergedMap = new Map<string, Conversation>();
+              prev.forEach((c) => mergedMap.set(c.id, c));
+              data.conversations.forEach((c: Conversation) => mergedMap.set(c.id, { ...mergedMap.get(c.id), ...c }));
+              const mergedList = Array.from(mergedMap.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+              LocalStorageManager.saveConversations(mergedList);
+              return mergedList;
+            });
+          }
+
+          if (data.messages && typeof data.messages === 'object') {
+            setMessages((prev) => {
+              const mergedMessages: Record<string, ChatMessage[]> = { ...prev };
+              for (const convId in data.messages) {
+                const serverList: ChatMessage[] = data.messages[convId];
+                const localList = mergedMessages[convId] || [];
+                const msgMap = new Map<string, ChatMessage>();
+                localList.forEach((m) => msgMap.set(m.id, m));
+                serverList.forEach((m) => {
+                  msgMap.set(m.id, m);
+                  if (m.metaMessageId) msgMap.set(m.metaMessageId, m);
+                });
+                const combined = Array.from(new Set(msgMap.values())).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+                mergedMessages[convId] = combined;
+              }
+              LocalStorageManager.saveMessages(mergedMessages);
+              return mergedMessages;
+            });
+          }
+        }
+      })
+      .catch((err) => console.warn('[Chats Sync] Initial sync error:', err));
+  }, [saasToken]);
+
   const handleSaveConversations = (newConvs: Conversation[]) => {
     setConversations(newConvs);
     LocalStorageManager.saveConversations(newConvs);
@@ -373,7 +417,7 @@ export default function App() {
           ? `/api/whatsapp/media/${msgData.document.id}` 
           : resolveMediaUrl(msgData.document?.url);
       } else if (msgData.type === 'sticker') {
-        type = 'image';
+        type = 'sticker';
         text = 'Sticker';
         mediaUrl = msgData.sticker?.id 
           ? `/api/whatsapp/media/${msgData.sticker.id}` 
@@ -408,6 +452,8 @@ export default function App() {
         }
       }
 
+      const isFromMe = Boolean(msgData.fromMe !== undefined ? msgData.fromMe : false);
+
       setConversations((prevConvs) => {
         const existing = prevConvs.find(
           (c) => c.phoneNumber.replace(/[^0-9]/g, '') === cleanSender
@@ -419,14 +465,14 @@ export default function App() {
           id: msgId,
           metaMessageId: msgData.id,
           conversationId: convId,
-          fromMe: false,
-          type,
-          text,
-          mediaUrl,
-          filename: fileName,
-          location: locationData,
+          fromMe: isFromMe,
+          type: (msgData.type === 'sticker' ? 'sticker' : type) as ChatMessage['type'],
+          text: msgData.caption || text,
+          mediaUrl: msgData.mediaUrl ? resolveMediaUrl(msgData.mediaUrl) : mediaUrl,
+          filename: fileName || msgData.filename,
+          location: locationData || msgData.location,
           timestamp: safeTimestamp,
-          status: 'read'
+          status: msgData.status || (isFromMe ? 'sent' : 'read')
         };
 
         // Atomically update messages for this conversation
@@ -452,7 +498,7 @@ export default function App() {
             phoneNumber: formattedPhone,
             name: senderName,
             avatarColor: randomColor,
-            unreadCount: 1,
+            unreadCount: isFromMe ? 0 : 1,
             updatedAt: incomingMsg.timestamp,
             lastMessage: incomingMsg
           };
@@ -463,7 +509,7 @@ export default function App() {
               return {
                 ...c,
                 name: senderName !== formattedPhone && senderName ? senderName : c.name,
-                unreadCount: (c.unreadCount || 0) + 1,
+                unreadCount: isFromMe ? (c.unreadCount || 0) : (c.unreadCount || 0) + 1,
                 updatedAt: incomingMsg.timestamp,
                 lastMessage: incomingMsg
               };
@@ -482,8 +528,10 @@ export default function App() {
         return updatedConvs;
       });
 
-      waAudio.playReceived();
-      waAudio.vibrate([30, 60]);
+      if (!isFromMe) {
+        waAudio.playReceived();
+        waAudio.vibrate([30, 60]);
+      }
     } else if (ev.type === 'status') {
       const statusData = ev.data;
       if (statusData.id && statusData.status) {

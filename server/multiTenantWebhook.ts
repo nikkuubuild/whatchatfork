@@ -167,18 +167,22 @@ export async function processInboundWebhookPayload(body: any, explicitTenantId?:
               textContent = msg.text?.body || '';
             } else if (msg.type === 'image') {
               textContent = msg.image?.caption || 'Photo';
-              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.image?.id || '')}`;
+              mediaUrl = `/api/whatsapp/media/${encodeURIComponent(msg.image?.id || '')}`;
               mediaCaption = msg.image?.caption || null;
             } else if (msg.type === 'video') {
               textContent = msg.video?.caption || 'Video';
-              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.video?.id || '')}`;
+              mediaUrl = `/api/whatsapp/media/${encodeURIComponent(msg.video?.id || '')}`;
+              mediaCaption = msg.video?.caption || null;
             } else if (msg.type === 'audio') {
               textContent = 'Voice message';
-              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.audio?.id || '')}`;
+              mediaUrl = `/api/whatsapp/media/${encodeURIComponent(msg.audio?.id || '')}`;
             } else if (msg.type === 'document') {
               textContent = msg.document?.filename || 'Document';
               filename = msg.document?.filename || null;
-              mediaUrl = `/api/whatsapp/proxy-media?mediaId=${encodeURIComponent(msg.document?.id || '')}`;
+              mediaUrl = `/api/whatsapp/media/${encodeURIComponent(msg.document?.id || '')}`;
+            } else if (msg.type === 'sticker') {
+              textContent = 'Sticker';
+              mediaUrl = `/api/whatsapp/media/${encodeURIComponent(msg.sticker?.id || '')}`;
             } else if (msg.type === 'location') {
               textContent = msg.location?.name || 'Shared Location';
               locationJson = JSON.stringify(msg.location);

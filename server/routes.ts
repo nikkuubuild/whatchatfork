@@ -432,14 +432,36 @@ saasRouter.post('/whatsapp/channels/:channelId/disconnect', authenticateToken, r
 // 3. MULTI-TENANT ISOLATED SSE STREAM
 // ==========================================
 
-saasRouter.get('/whatsapp/events', authenticateToken, requireTenant, async (req: AuthenticatedRequest, res: Response) => {
-  let tenantId = req.tenantId;
-  if (!tenantId) {
-    const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
-      || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
-    tenantId = defaultTenant?.id || 'tenant_default_01';
-    req.tenantId = tenantId;
+saasRouter.get('/whatsapp/events', async (req: AuthenticatedRequest, res: Response) => {
+  const authHeader = req.headers.authorization;
+  const queryToken = req.query.token as string | undefined;
+  let tenantId: string | undefined = undefined;
+
+  let rawToken: string | null = null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    rawToken = authHeader.substring(7).trim();
+  } else if (queryToken) {
+    rawToken = queryToken.trim();
   }
+
+  if (rawToken) {
+    const authUser = verifyToken(rawToken);
+    if (authUser?.tenantId) {
+      tenantId = authUser.tenantId;
+      req.user = authUser;
+    }
+  }
+
+  if (!tenantId) {
+    try {
+      const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+        || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+      tenantId = defaultTenant?.id || 'tenant_default_01';
+    } catch (_) {
+      tenantId = 'tenant_default_01';
+    }
+  }
+  req.tenantId = tenantId;
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -455,35 +477,153 @@ saasRouter.get('/whatsapp/events', authenticateToken, requireTenant, async (req:
   // Send ACK with tenant context
   res.write(`data: ${JSON.stringify({ type: 'connected', clientId, tenantId, serverTime: Date.now() })}\n\n`);
 
-  // Send initial backlog of latest messages & conversations for this tenant only
-  const recentMessages = await db.prepare(`
-    SELECT m.*, c.customer_phone, c.customer_name
-    FROM messages m
-    JOIN conversations c ON m.conversation_id = c.id
-    WHERE m.tenant_id = ?
-    ORDER BY m.created_at DESC LIMIT 50
-  `).all(tenantId);
+  // Send initial backlog of latest messages & conversations for this tenant (includes sent & received with full media)
+  try {
+    const recentMessages = (await db.prepare(`
+      SELECT m.*, c.customer_phone, c.customer_name
+      FROM messages m
+      JOIN conversations c ON m.conversation_id = c.id
+      WHERE m.tenant_id = ?
+      ORDER BY m.created_at DESC LIMIT 150
+    `).all(tenantId)) as any[];
 
-  res.write(`data: ${JSON.stringify({
-    type: 'backlog',
-    events: recentMessages.reverse().map((m: any) => ({
-      id: m.meta_message_id || m.id,
-      type: 'message',
-      timestamp: m.created_at,
-      data: {
-        id: m.meta_message_id || m.id,
-        from: m.customer_phone,
-        contactName: m.customer_name || m.customer_phone,
-        type: m.type,
-        text: { body: m.text },
-        timestamp: Math.floor(m.created_at / 1000)
-      }
-    }))
-  })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      type: 'backlog',
+      events: recentMessages.reverse().map((m: any) => {
+        let locData = undefined;
+        if (m.location_json) {
+          try { locData = JSON.parse(m.location_json); } catch (_) {}
+        }
+        return {
+          id: m.meta_message_id || m.id,
+          type: 'message',
+          timestamp: Number(m.created_at),
+          data: {
+            id: m.meta_message_id || m.id,
+            from: m.customer_phone,
+            contactName: m.customer_name || m.customer_phone,
+            fromMe: Boolean(m.from_me),
+            type: m.type,
+            text: m.text ? { body: m.text } : undefined,
+            caption: m.media_caption || undefined,
+            mediaUrl: m.media_url || undefined,
+            filename: m.filename || undefined,
+            location: locData,
+            status: m.status || (m.from_me ? 'sent' : 'read'),
+            timestamp: Number(m.created_at)
+          }
+        };
+      })
+    })}\n\n`);
+  } catch (_) {}
 
   req.on('close', () => {
-    unregisterTenantSseClient(tenantId, clientId);
+    unregisterTenantSseClient(tenantId as string, clientId);
   });
+});
+
+// Full Multi-Device History Sync (Syncs all conversations and complete message history for any device)
+saasRouter.get('/chats/sync', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const queryToken = req.query.token as string | undefined;
+    let tenantId: string | undefined = undefined;
+
+    let rawToken: string | null = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      rawToken = authHeader.substring(7).trim();
+    } else if (queryToken) {
+      rawToken = queryToken.trim();
+    }
+
+    if (rawToken) {
+      const authUser = verifyToken(rawToken);
+      if (authUser?.tenantId) {
+        tenantId = authUser.tenantId;
+      }
+    }
+
+    if (!tenantId) {
+      try {
+        const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+          || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+        tenantId = defaultTenant?.id || 'tenant_default_01';
+      } catch (_) {
+        tenantId = 'tenant_default_01';
+      }
+    }
+
+    const convRows = (await db.prepare(`
+      SELECT * FROM conversations
+      WHERE tenant_id = ?
+      ORDER BY updated_at DESC
+    `).all(tenantId)) as any[];
+
+    const msgRows = (await db.prepare(`
+      SELECT m.*, c.customer_phone
+      FROM messages m
+      JOIN conversations c ON m.conversation_id = c.id
+      WHERE m.tenant_id = ?
+      ORDER BY m.created_at ASC
+    `).all(tenantId)) as any[];
+
+    const messagesByConv: Record<string, any[]> = {};
+    for (const m of msgRows) {
+      const cleanPhone = String(m.customer_phone || '').replace(/[^0-9]/g, '');
+      const frontendConvId = cleanPhone ? `conv_${cleanPhone}` : m.conversation_id;
+
+      if (!messagesByConv[frontendConvId]) {
+        messagesByConv[frontendConvId] = [];
+      }
+
+      let locationData = undefined;
+      if (m.location_json) {
+        try { locationData = JSON.parse(m.location_json); } catch (_) {}
+      }
+
+      messagesByConv[frontendConvId].push({
+        id: m.meta_message_id || m.id,
+        metaMessageId: m.meta_message_id || undefined,
+        conversationId: frontendConvId,
+        fromMe: Boolean(m.from_me),
+        type: m.type,
+        text: m.text || '',
+        mediaUrl: m.media_url || undefined,
+        mediaCaption: m.media_caption || undefined,
+        filename: m.filename || undefined,
+        location: locationData,
+        status: m.status || (m.from_me ? 'sent' : 'read'),
+        timestamp: Number(m.created_at)
+      });
+    }
+
+    const formattedConvs = convRows.map((c) => {
+      const cleanPhone = String(c.customer_phone || '').replace(/[^0-9]/g, '');
+      const frontendConvId = cleanPhone ? `conv_${cleanPhone}` : c.id;
+      const convMsgs = messagesByConv[frontendConvId] || [];
+      const lastMsg = convMsgs.length > 0 ? convMsgs[convMsgs.length - 1] : undefined;
+
+      return {
+        id: frontendConvId,
+        phoneNumber: c.customer_phone.startsWith('+') ? c.customer_phone : `+${c.customer_phone}`,
+        name: c.customer_name || c.customer_phone,
+        avatarColor: c.avatar_color || '#008069',
+        unreadCount: Number(c.unread_count || 0),
+        updatedAt: Number(c.updated_at || c.created_at),
+        lastMessage: lastMsg
+      };
+    });
+
+    return res.json({
+      success: true,
+      tenantId,
+      conversations: formattedConvs,
+      messages: messagesByConv
+    });
+  } catch (err: any) {
+    console.error('[Chats Sync Error]:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to sync chats' });
+  }
 });
 
 // ==========================================

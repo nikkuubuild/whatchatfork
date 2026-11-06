@@ -1,6 +1,6 @@
 export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 
-export type MessageType = 'text' | 'image' | 'audio' | 'video' | 'document' | 'location' | 'template';
+export type MessageType = 'text' | 'image' | 'audio' | 'video' | 'document' | 'location' | 'template' | 'sticker';
 
 export interface WhatsAppCredentials {
   phoneNumberId: string;

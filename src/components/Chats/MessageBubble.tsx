@@ -185,7 +185,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     <div className={`flex w-full my-1.5 px-2.5 ${fromMe ? 'justify-end' : 'justify-start'}`}>
       <div
         className={`relative max-w-[88%] sm:max-w-[72%] rounded-2xl px-3 py-2 shadow-xs transition-colors ${
-          fromMe
+          type === 'sticker'
+            ? 'bg-transparent shadow-none px-1 py-1'
+            : fromMe
             ? 'bg-[#E7FFDB] dark:bg-[#005C4B] text-slate-900 dark:text-slate-100 rounded-tr-xs'
             : 'bg-white dark:bg-[#202C33] text-slate-900 dark:text-slate-100 rounded-tl-xs border border-black/5 dark:border-white/5'
         }`}
@@ -278,6 +280,29 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             {mediaCaption && (
               <p className="text-[14px] px-1 pt-1 break-words select-text">{mediaCaption}</p>
             )}
+          </div>
+        )}
+
+        {/* 2b. STICKER MESSAGE */}
+        {type === 'sticker' && (
+          <div className="py-1">
+            <div
+              onClick={() => onOpenMedia?.({
+                type: 'image',
+                url: resolvedUrl,
+                caption: 'Sticker',
+                timestamp,
+                senderName: fromMe ? 'You' : 'Customer'
+              })}
+              className="cursor-pointer max-w-[160px] max-h-[160px] flex items-center justify-center group"
+            >
+              <img
+                src={resolvedUrl}
+                alt="WhatsApp Sticker"
+                className="w-32 h-32 object-contain group-hover:scale-105 transition-transform duration-200"
+                loading="lazy"
+              />
+            </div>
           </div>
         )}
 

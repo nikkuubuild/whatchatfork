@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Search, Plus, Pin, Mic, Image, FileText, CheckCheck, UserPlus, X } from 'lucide-react';
+import { Search, Plus, Pin, Mic, Image, FileText, CheckCheck, UserPlus, X, Video, MapPin, Smile } from 'lucide-react';
 import { Conversation, ChatMessage } from '../../types/whatsapp';
 
 interface ChatListProps {
@@ -64,8 +64,14 @@ export const ChatList: React.FC<ChatListProps> = ({
           return <Mic className="w-3.5 h-3.5 inline mr-1 text-[#008069] dark:text-[#25D366]" />;
         case 'image':
           return <Image className="w-3.5 h-3.5 inline mr-1 text-slate-500" />;
+        case 'video':
+          return <Video className="w-3.5 h-3.5 inline mr-1 text-slate-500" />;
         case 'document':
           return <FileText className="w-3.5 h-3.5 inline mr-1 text-slate-500" />;
+        case 'sticker':
+          return <Smile className="w-3.5 h-3.5 inline mr-1 text-amber-500" />;
+        case 'location':
+          return <MapPin className="w-3.5 h-3.5 inline mr-1 text-rose-500" />;
         default:
           return null;
       }
