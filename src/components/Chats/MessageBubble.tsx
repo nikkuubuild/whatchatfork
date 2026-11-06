@@ -12,9 +12,13 @@ import {
   ExternalLink,
   Mic,
   Maximize2,
-  BookmarkPlus
+  BookmarkPlus,
+  Image as ImageIcon,
+  ImageOff,
+  RotateCcw
 } from 'lucide-react';
 import { ChatMessage } from '../../types/whatsapp';
+import { resolveMediaUrl } from '../../utils/mediaResolver';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -38,6 +42,14 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   onPinToQuickFiles
 }) => {
   const { fromMe, type, text, mediaUrl, mediaCaption, filename, fileSize, duration, location, timestamp, status, templateName } = message;
+
+  // Resolve media URL (handles Meta lookaside URLs, relative /uploads/ and /api/whatsapp/media paths)
+  const resolvedUrl = resolveMediaUrl(mediaUrl);
+
+  // Image loading / error fallback state
+  const [imageLoaded, setImageLoaded] = useState(false);
+  const [imageError, setImageError] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
 
   // Audio player state for voice notes
   const [isPlaying, setIsPlaying] = useState(false);
@@ -71,8 +83,13 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     }
   };
 
-  const formatTime = (ts: number) => {
-    const d = new Date(ts);
+  const formatTime = (ts: any) => {
+    if (!ts) return '';
+    let num = typeof ts === 'number' ? ts : parseInt(String(ts), 10);
+    if (isNaN(num)) return '';
+    if (num < 1e12) num *= 1000;
+    const d = new Date(num);
+    if (isNaN(d.getTime())) return '';
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
@@ -84,8 +101,8 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 
   // Play / Pause voice note
   const toggleAudio = () => {
-    if (!audioRef.current && mediaUrl) {
-      const audio = new Audio(mediaUrl);
+    if (!audioRef.current && resolvedUrl) {
+      const audio = new Audio(resolvedUrl);
       audio.playbackRate = playbackSpeed;
       audio.ontimeupdate = () => {
         const cur = audio.currentTime;
@@ -190,28 +207,74 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         {/* 2. IMAGE MESSAGE */}
         {type === 'image' && (
           <div className="space-y-1.5 -mx-1 -mt-0.5">
-            <div 
-              onClick={() => onOpenMedia?.({
-                type: 'image',
-                url: mediaUrl || '',
-                caption: mediaCaption,
-                timestamp,
-                senderName: fromMe ? 'You' : 'Customer'
-              })}
-              className="relative rounded-xl overflow-hidden bg-slate-200 dark:bg-slate-800 max-h-72 cursor-pointer group"
-            >
-              <img
-                src={mediaUrl}
-                alt={mediaCaption || 'WhatsApp Image'}
-                className="w-full h-auto max-h-72 object-cover group-hover:scale-102 transition-transform duration-200"
-                loading="lazy"
-              />
-              <div className="absolute inset-0 bg-black/0 group-hover:bg-black/15 transition-colors flex items-center justify-center">
-                <div className="opacity-0 group-hover:opacity-100 bg-black/60 rounded-full p-2 text-white transition-opacity">
-                  <Maximize2 className="w-4 h-4" />
+            {imageError ? (
+              <div 
+                onClick={() => onOpenMedia?.({
+                  type: 'image',
+                  url: resolvedUrl,
+                  caption: mediaCaption,
+                  timestamp,
+                  senderName: fromMe ? 'You' : 'Customer'
+                })}
+                className="relative rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800/80 p-3.5 min-w-[210px] max-w-sm flex flex-col items-center justify-center text-center gap-2 border border-slate-200 dark:border-slate-700/60 cursor-pointer"
+              >
+                <div className="w-9 h-9 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center text-slate-500 dark:text-slate-400">
+                  <ImageOff className="w-4 h-4" />
                 </div>
+                <div className="text-xs text-slate-600 dark:text-slate-300">
+                  <span className="font-semibold block truncate max-w-[200px]">{filename || mediaCaption || 'WhatsApp Photo'}</span>
+                  <span className="text-[10px] text-slate-400">Tap to view or reload</span>
+                </div>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setImageError(false);
+                    setImageLoaded(false);
+                    setRetryKey((k) => k + 1);
+                  }}
+                  className="px-2.5 py-1 text-[11px] font-semibold bg-[#008069] hover:bg-[#00705c] dark:bg-[#25D366] text-white rounded-lg flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>Reload Image</span>
+                </button>
               </div>
-            </div>
+            ) : (
+              <div 
+                onClick={() => onOpenMedia?.({
+                  type: 'image',
+                  url: resolvedUrl,
+                  caption: mediaCaption,
+                  timestamp,
+                  senderName: fromMe ? 'You' : 'Customer'
+                })}
+                className="relative rounded-xl overflow-hidden bg-slate-200/60 dark:bg-slate-800/60 min-w-[220px] max-w-sm max-h-80 cursor-pointer group shadow-2xs"
+              >
+                {!imageLoaded && (
+                  <div className="h-44 w-full bg-slate-200 dark:bg-slate-800 animate-pulse flex flex-col items-center justify-center text-slate-400 gap-2">
+                    <ImageIcon className="w-7 h-7 opacity-50" />
+                    <span className="text-[10.5px] text-slate-400 font-medium">Loading image...</span>
+                  </div>
+                )}
+                <img
+                  key={retryKey}
+                  src={retryKey > 0 ? `${resolvedUrl}${resolvedUrl.includes('?') ? '&' : '?'}retry=${retryKey}` : resolvedUrl}
+                  alt={mediaCaption || filename || 'WhatsApp Image'}
+                  onLoad={() => setImageLoaded(true)}
+                  onError={() => setImageError(true)}
+                  className={`w-full h-auto max-h-80 object-cover group-hover:scale-102 transition-all duration-200 ${
+                    imageLoaded ? 'block opacity-100' : 'hidden opacity-0'
+                  }`}
+                  loading="lazy"
+                />
+                {imageLoaded && (
+                  <div className="absolute inset-0 bg-black/0 group-hover:bg-black/15 transition-colors flex items-center justify-center pointer-events-none">
+                    <div className="opacity-0 group-hover:opacity-100 bg-black/60 rounded-full p-2 text-white transition-opacity shadow-md">
+                      <Maximize2 className="w-4 h-4" />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
             {mediaCaption && (
               <p className="text-[14px] px-1 pt-1 break-words select-text">{mediaCaption}</p>
             )}
@@ -221,9 +284,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         {/* 3. VIDEO MESSAGE (In-app playable) */}
         {type === 'video' && (
           <div className="space-y-1.5 -mx-1 -mt-0.5">
-            <div className="relative rounded-xl overflow-hidden bg-black max-h-72 group">
+            <div className="relative rounded-xl overflow-hidden bg-black max-h-72 min-w-[220px] max-w-sm group shadow-2xs">
               <video
-                src={mediaUrl}
+                src={resolvedUrl}
                 controls
                 playsInline
                 preload="metadata"
@@ -232,7 +295,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
               <button
                 onClick={() => onOpenMedia?.({
                   type: 'video',
-                  url: mediaUrl || '',
+                  url: resolvedUrl,
                   caption: mediaCaption,
                   timestamp,
                   senderName: fromMe ? 'You' : 'Customer'
@@ -325,7 +388,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             <div 
               onClick={() => onOpenMedia?.({
                 type: 'document',
-                url: mediaUrl || '',
+                url: resolvedUrl || '',
                 filename,
                 fileSize,
                 caption: mediaCaption,
@@ -345,9 +408,15 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                   {fileSize ? `${(fileSize / (1024 * 1024)).toFixed(1)} MB` : 'PDF Document'} · Tap to View
                 </p>
               </div>
-              <div className="w-8 h-8 rounded-full bg-white/80 dark:bg-slate-700 flex items-center justify-center text-slate-700 dark:text-slate-200">
+              <a
+                href={resolvedUrl || '#'}
+                download={filename || 'Document.pdf'}
+                onClick={(e) => e.stopPropagation()}
+                className="w-8 h-8 rounded-full bg-white/80 dark:bg-slate-700 hover:bg-white dark:hover:bg-slate-600 flex items-center justify-center text-slate-700 dark:text-slate-200 transition-colors shadow-2xs"
+                title="Download Document"
+              >
                 <Download className="w-4 h-4" />
-              </div>
+              </a>
             </div>
             {mediaCaption && (
               <p className="text-[14px] px-1 pt-1 break-words select-text">{mediaCaption}</p>

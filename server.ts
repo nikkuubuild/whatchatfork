@@ -367,14 +367,16 @@ app.post('/api/whatsapp/upload-local-media', async (req, res) => {
 
     fs.writeFileSync(filePath, buffer);
 
-    // Build accessible URL
-    const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
-    const publicUrl = `${appUrl}/uploads/${safeName}`;
+    // Build accessible URL (relative url for clean in-browser loading on any domain, plus full URL for external dispatches)
+    const appUrl = getAppBaseUrl(req);
+    const encodedSafeName = encodeURIComponent(safeName);
+    const publicUrl = `${appUrl}/uploads/${encodedSafeName}`;
 
     return res.json({
       success: true,
       filename: safeName,
-      url: publicUrl,
+      url: `/uploads/${encodedSafeName}`,
+      fullUrl: publicUrl,
       size: buffer.length,
       mimeType
     });
@@ -387,16 +389,26 @@ app.post('/api/whatsapp/upload-local-media', async (req, res) => {
   }
 });
 
-// Proxy: Stream/Download media from Meta WhatsApp Cloud API (supports both :mediaId and /proxy-media?mediaId=...)
+// Proxy: Stream/Download media from Meta WhatsApp Cloud API (supports both :mediaId and /proxy-media?url=... or ?mediaId=...)
 const handleMediaProxy = async (req: express.Request, res: express.Response) => {
   try {
-    const mediaId = req.params?.mediaId || (req.query?.mediaId as string) || (req.query?.id as string);
-    if (!mediaId) {
-      return res.status(400).json({ success: false, error: 'Media ID is required' });
+    let mediaId = req.params?.mediaId || (req.query?.mediaId as string) || (req.query?.id as string);
+    const directUrl = (req.query?.url as string | undefined)?.trim();
+
+    // If direct lookaside URL provided, extract mid if present
+    if (!mediaId && directUrl) {
+      const match = directUrl.match(/mid=([0-9]+)/i);
+      if (match && match[1]) {
+        mediaId = match[1];
+      }
+    }
+
+    if (!mediaId && !directUrl) {
+      return res.status(400).json({ success: false, error: 'Media ID or URL is required' });
     }
 
     // Check if media is already cached on disk in public/uploads/
-    const safeMediaId = String(mediaId).replace(/[^a-zA-Z0-9_-]/g, '');
+    const safeMediaId = String(mediaId || directUrl).replace(/[^a-zA-Z0-9_-]/g, '').substring(0, 64);
     const metaCacheFile = path.join(UPLOADS_DIR, `media_${safeMediaId}.meta`);
     const dataCacheFile = path.join(UPLOADS_DIR, `media_${safeMediaId}.bin`);
 
@@ -433,27 +445,43 @@ const handleMediaProxy = async (req: express.Request, res: express.Response) => 
       return res.status(401).json({ success: false, error: 'Access token required to fetch WhatsApp media' });
     }
 
-    // 1. Retrieve the media URL from Meta Graph API
-    const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    const metaData = await metaRes.json();
-    if (!metaRes.ok || !metaData.url) {
-      return res.status(metaRes.status || 400).json({
+    let downloadUrl: string | null = null;
+    let mimeType: string | null = null;
+
+    if (mediaId) {
+      // 1. Retrieve the media URL from Meta Graph API
+      try {
+        const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const metaData = await metaRes.json();
+        if (metaRes.ok && metaData.url) {
+          downloadUrl = metaData.url;
+          mimeType = metaData.mime_type || null;
+        }
+      } catch (_) {}
+    }
+
+    if (!downloadUrl && directUrl) {
+      downloadUrl = directUrl;
+    }
+
+    if (!downloadUrl) {
+      return res.status(404).json({
         success: false,
-        error: metaData?.error?.message || 'Failed to retrieve media URL from Meta'
+        error: 'Failed to retrieve media URL from Meta'
       });
     }
 
     // 2. Fetch binary stream from Meta CDN using Bearer auth
-    const fileRes = await fetch(metaData.url, {
+    const fileRes = await fetch(downloadUrl, {
       headers: { Authorization: `Bearer ${token}` }
     });
     if (!fileRes.ok) {
       return res.status(fileRes.status).send('Failed to fetch media file stream from Meta');
     }
 
-    const contentType = fileRes.headers.get('content-type') || metaData.mime_type || 'application/octet-stream';
+    const contentType = fileRes.headers.get('content-type') || mimeType || 'application/octet-stream';
     const arrayBuffer = await fileRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 

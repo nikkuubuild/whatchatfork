@@ -35,8 +35,13 @@ export const ChatList: React.FC<ChatListProps> = ({
     setShowNewChatModal(false);
   };
 
-  const formatTimestamp = (ts: number) => {
-    const date = new Date(ts);
+  const formatTimestamp = (ts: any) => {
+    if (!ts) return '';
+    let num = typeof ts === 'number' ? ts : parseInt(String(ts), 10);
+    if (isNaN(num)) return '';
+    if (num < 1e12) num *= 1000;
+    const date = new Date(num);
+    if (isNaN(date.getTime())) return '';
     const now = new Date();
     const isToday = date.toDateString() === now.toDateString();
 

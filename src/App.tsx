@@ -26,6 +26,7 @@ import {
 } from './types/whatsapp';
 import { WhatsAppApiService } from './services/whatsappApi';
 import { waAudio } from './utils/audio';
+import { resolveMediaUrl } from './utils/mediaResolver';
 import { MessageSquare } from 'lucide-react';
 
 export default function App() {
@@ -349,20 +350,34 @@ export default function App() {
       if (msgData.type === 'image') {
         type = 'image';
         text = msgData.image?.caption || '';
-        mediaUrl = msgData.image?.url || (msgData.image?.id ? `/api/whatsapp/media/${msgData.image.id}` : undefined);
+        mediaUrl = msgData.image?.id 
+          ? `/api/whatsapp/media/${msgData.image.id}` 
+          : resolveMediaUrl(msgData.image?.url);
       } else if (msgData.type === 'video') {
         type = 'video';
         text = msgData.video?.caption || '';
-        mediaUrl = msgData.video?.url || (msgData.video?.id ? `/api/whatsapp/media/${msgData.video.id}` : undefined);
+        mediaUrl = msgData.video?.id 
+          ? `/api/whatsapp/media/${msgData.video.id}` 
+          : resolveMediaUrl(msgData.video?.url);
       } else if (msgData.type === 'audio') {
         type = 'audio';
         text = msgData.audio?.caption || 'Voice message';
-        mediaUrl = msgData.audio?.url || (msgData.audio?.id ? `/api/whatsapp/media/${msgData.audio.id}` : undefined);
+        mediaUrl = msgData.audio?.id 
+          ? `/api/whatsapp/media/${msgData.audio.id}` 
+          : resolveMediaUrl(msgData.audio?.url);
       } else if (msgData.type === 'document') {
         type = 'document';
         text = msgData.document?.caption || msgData.document?.filename || 'Document';
         fileName = msgData.document?.filename;
-        mediaUrl = msgData.document?.url || (msgData.document?.id ? `/api/whatsapp/media/${msgData.document.id}` : undefined);
+        mediaUrl = msgData.document?.id 
+          ? `/api/whatsapp/media/${msgData.document.id}` 
+          : resolveMediaUrl(msgData.document?.url);
+      } else if (msgData.type === 'sticker') {
+        type = 'image';
+        text = 'Sticker';
+        mediaUrl = msgData.sticker?.id 
+          ? `/api/whatsapp/media/${msgData.sticker.id}` 
+          : resolveMediaUrl(msgData.sticker?.url);
       } else if (msgData.type === 'location') {
         type = 'location';
         const loc = msgData.location;
@@ -381,6 +396,18 @@ export default function App() {
 
       const msgId = msgData.id || `inc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
+      // Safe timestamp parsing (avoids NaN or "Invalid Date")
+      let safeTimestamp = Date.now();
+      const rawTs = ev.timestamp || msgData.timestamp;
+      if (typeof rawTs === 'number') {
+        safeTimestamp = rawTs < 1e12 ? rawTs * 1000 : rawTs;
+      } else if (typeof rawTs === 'string' && rawTs.trim()) {
+        const parsed = parseInt(rawTs, 10);
+        if (!isNaN(parsed)) {
+          safeTimestamp = rawTs.length === 10 ? parsed * 1000 : parsed;
+        }
+      }
+
       setConversations((prevConvs) => {
         const existing = prevConvs.find(
           (c) => c.phoneNumber.replace(/[^0-9]/g, '') === cleanSender
@@ -398,7 +425,7 @@ export default function App() {
           mediaUrl,
           filename: fileName,
           location: locationData,
-          timestamp: ev.timestamp || (parseInt(msgData.timestamp || '0', 10) * 1000) || Date.now(),
+          timestamp: safeTimestamp,
           status: 'read'
         };
 

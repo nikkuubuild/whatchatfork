@@ -1,6 +1,7 @@
 import React from 'react';
 import { X, Download, ArrowLeft, FileText, Share2, ZoomIn, ZoomOut } from 'lucide-react';
 import { ChatMessage } from '../../types/whatsapp';
+import { resolveMediaUrl } from '../../utils/mediaResolver';
 
 interface MediaViewerModalProps {
   media: {
@@ -20,9 +21,16 @@ export const MediaViewerModal: React.FC<MediaViewerModalProps> = ({ media, onClo
 
   if (!media) return null;
 
-  const formatTime = (ts?: number) => {
+  const resolvedUrl = resolveMediaUrl(media.url);
+
+  const formatTime = (ts?: any) => {
     if (!ts) return '';
-    return new Date(ts).toLocaleString([], {
+    let num = typeof ts === 'number' ? ts : parseInt(String(ts), 10);
+    if (isNaN(num)) return '';
+    if (num < 1e12) num *= 1000;
+    const d = new Date(num);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleString([], {
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
@@ -72,9 +80,9 @@ export const MediaViewerModal: React.FC<MediaViewerModalProps> = ({ media, onClo
             </>
           )}
 
-          {media.url && (
+          {resolvedUrl && (
             <a
-              href={media.url}
+              href={resolvedUrl}
               download={media.filename || 'whatsapp_media'}
               target="_blank"
               rel="noopener noreferrer"
@@ -100,7 +108,7 @@ export const MediaViewerModal: React.FC<MediaViewerModalProps> = ({ media, onClo
         {media.type === 'image' && (
           <div className="max-w-4xl max-h-full flex flex-col items-center justify-center">
             <img
-              src={media.url}
+              src={resolvedUrl}
               alt={media.caption || 'Image'}
               style={{ transform: `scale(${zoom})` }}
               className="max-h-[75vh] w-auto max-w-full object-contain rounded-lg shadow-2xl transition-transform duration-200 cursor-zoom-in"
@@ -132,7 +140,7 @@ export const MediaViewerModal: React.FC<MediaViewerModalProps> = ({ media, onClo
 
             <div className="pt-2 flex items-center gap-2">
               <a
-                href={media.url}
+                href={resolvedUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-[#008069] hover:bg-[#00A884] text-white font-semibold text-xs shadow-md transition-all"
@@ -147,7 +155,7 @@ export const MediaViewerModal: React.FC<MediaViewerModalProps> = ({ media, onClo
         {media.type === 'video' && (
           <div className="max-w-3xl w-full">
             <video
-              src={media.url}
+              src={resolvedUrl}
               controls
               autoPlay
               className="w-full max-h-[75vh] rounded-xl shadow-2xl object-contain bg-black"

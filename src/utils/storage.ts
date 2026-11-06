@@ -1,6 +1,7 @@
 import { WhatsAppCredentials, Conversation, ChatMessage, WhatsAppTemplate, BroadcastCampaign, QuickFile, QuickLocationPreset, QuickPresetsSettings } from '../types/whatsapp';
 import { generateVoiceNoteWavUrl } from './audioGenerator';
 import { getSampleImageDataUrl, getSampleVideoUrl } from './sampleMedia';
+import { resolveMediaUrl } from './mediaResolver';
 
 const STORAGE_KEYS = {
   CREDENTIALS: 'whatscloud_credentials_v1',
@@ -367,6 +368,21 @@ export const LocalStorageManager = {
         delete parsed.conv_2;
         delete parsed.conv_3;
         delete parsed.conv_4;
+
+        // Auto-heal media URLs and timestamps for all messages
+        for (const cId in parsed) {
+          if (Array.isArray(parsed[cId])) {
+            parsed[cId] = parsed[cId].map((m: any) => {
+              if (m.mediaUrl) {
+                m.mediaUrl = resolveMediaUrl(m.mediaUrl);
+              }
+              if (m.timestamp && typeof m.timestamp === 'string') {
+                m.timestamp = m.timestamp.length === 10 ? parseInt(m.timestamp, 10) * 1000 : parseInt(m.timestamp, 10);
+              }
+              return m;
+            });
+          }
+        }
 
         // Ensure conv_917372893607 messages exist
         if (!parsed.conv_917372893607 || parsed.conv_917372893607.length === 0) {
