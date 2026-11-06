@@ -387,16 +387,53 @@ app.post('/api/whatsapp/upload-local-media', async (req, res) => {
   }
 });
 
-// Proxy: Stream/Download media from Meta WhatsApp Cloud API
-app.get('/api/whatsapp/media/:mediaId', async (req, res) => {
+// Proxy: Stream/Download media from Meta WhatsApp Cloud API (supports both :mediaId and /proxy-media?mediaId=...)
+const handleMediaProxy = async (req: express.Request, res: express.Response) => {
   try {
-    const { mediaId } = req.params;
-    const token = (req.query.token as string) || req.headers.authorization?.replace('Bearer ', '') || lastKnownToken;
+    const mediaId = req.params?.mediaId || (req.query?.mediaId as string) || (req.query?.id as string);
+    if (!mediaId) {
+      return res.status(400).json({ success: false, error: 'Media ID is required' });
+    }
+
+    // Check if media is already cached on disk in public/uploads/
+    const safeMediaId = String(mediaId).replace(/[^a-zA-Z0-9_-]/g, '');
+    const metaCacheFile = path.join(UPLOADS_DIR, `media_${safeMediaId}.meta`);
+    const dataCacheFile = path.join(UPLOADS_DIR, `media_${safeMediaId}.bin`);
+
+    if (fs.existsSync(metaCacheFile) && fs.existsSync(dataCacheFile)) {
+      try {
+        const cachedMeta = JSON.parse(fs.readFileSync(metaCacheFile, 'utf-8'));
+        const fileStat = fs.statSync(dataCacheFile);
+        res.setHeader('Content-Type', cachedMeta.contentType || 'application/octet-stream');
+        res.setHeader('Content-Length', fileStat.size);
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        const readStream = fs.createReadStream(dataCacheFile);
+        return readStream.pipe(res);
+      } catch (_) {}
+    }
+
+    // Resolve token via multi-tier fallback
+    let token = (req.query.token as string) || req.headers.authorization?.replace('Bearer ', '') || lastKnownToken;
+    if (!token) {
+      const saved = loadSavedCredentials();
+      token = saved?.accessToken || '';
+    }
+    if (!token) {
+      try {
+        const chan = (await db.prepare("SELECT access_token FROM whatsapp_channels WHERE access_token IS NOT NULL AND access_token != '' ORDER BY connected_at DESC LIMIT 1").get()) as any;
+        if (chan?.access_token) token = chan.access_token;
+      } catch (_) {}
+    }
+    if (!token) {
+      token = process.env.WHATSAPP_ACCESS_TOKEN || '';
+    }
+
     if (!token) {
       return res.status(401).json({ success: false, error: 'Access token required to fetch WhatsApp media' });
     }
 
-    // 1. Retrieve the media URL from Meta
+    // 1. Retrieve the media URL from Meta Graph API
     const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
@@ -408,26 +445,44 @@ app.get('/api/whatsapp/media/:mediaId', async (req, res) => {
       });
     }
 
-    // 2. Fetch the binary file from the Meta CDN using Bearer auth
+    // 2. Fetch binary stream from Meta CDN using Bearer auth
     const fileRes = await fetch(metaData.url, {
       headers: { Authorization: `Bearer ${token}` }
     });
     if (!fileRes.ok) {
-      return res.status(fileRes.status).send('Failed to fetch media file stream');
+      return res.status(fileRes.status).send('Failed to fetch media file stream from Meta');
     }
 
     const contentType = fileRes.headers.get('content-type') || metaData.mime_type || 'application/octet-stream';
-    res.setHeader('Content-Type', contentType);
-    if (metaData.file_size) {
-      res.setHeader('Content-Length', metaData.file_size);
-    }
     const arrayBuffer = await fileRes.arrayBuffer();
-    return res.send(Buffer.from(arrayBuffer));
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Save to disk cache for future instant access
+    try {
+      if (!fs.existsSync(UPLOADS_DIR)) {
+        fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      }
+      fs.writeFileSync(dataCacheFile, buffer);
+      fs.writeFileSync(metaCacheFile, JSON.stringify({
+        contentType,
+        fileSize: buffer.length,
+        cachedAt: Date.now()
+      }));
+    } catch (_) {}
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    return res.send(buffer);
   } catch (err: any) {
     console.error('Error proxying WhatsApp media:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Internal error downloading media' });
   }
-});
+};
+
+app.get('/api/whatsapp/media/:mediaId', handleMediaProxy);
+app.get('/api/whatsapp/proxy-media', handleMediaProxy);
 
 // Supported webhook paths (global, tenant-specific, and WhatsJet /whatsapp-webhook/{vendorUid} routes)
 const WEBHOOK_PATHS = [

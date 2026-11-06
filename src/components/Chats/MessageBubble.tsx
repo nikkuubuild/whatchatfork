@@ -89,7 +89,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
       audio.playbackRate = playbackSpeed;
       audio.ontimeupdate = () => {
         const cur = audio.currentTime;
-        const dur = audio.duration || duration || 1;
+        const dur = (audio.duration && isFinite(audio.duration)) ? audio.duration : (duration || 12);
         setCurrentSec(cur);
         setPlaybackProgress((cur / dur) * 100);
       };
@@ -117,6 +117,16 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
       playWebAudioTone();
     }
   };
+
+  // Cleanup audio element on unmount
+  useEffect(() => {
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
+  }, []);
 
   // Tone fallback for in-app audio if browser blocks audio tag
   const playWebAudioTone = () => {
@@ -211,7 +221,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
         {/* 3. VIDEO MESSAGE (In-app playable) */}
         {type === 'video' && (
           <div className="space-y-1.5 -mx-1 -mt-0.5">
-            <div className="rounded-xl overflow-hidden bg-black max-h-72">
+            <div className="relative rounded-xl overflow-hidden bg-black max-h-72 group">
               <video
                 src={mediaUrl}
                 controls
@@ -219,6 +229,19 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 preload="metadata"
                 className="w-full h-auto max-h-72 object-contain"
               />
+              <button
+                onClick={() => onOpenMedia?.({
+                  type: 'video',
+                  url: mediaUrl || '',
+                  caption: mediaCaption,
+                  timestamp,
+                  senderName: fromMe ? 'You' : 'Customer'
+                })}
+                className="absolute top-2 right-2 p-1.5 rounded-full bg-black/60 hover:bg-black/80 text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                title="Fullscreen Lightbox"
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+              </button>
             </div>
             {mediaCaption && (
               <p className="text-[14px] px-1 pt-1 break-words select-text">{mediaCaption}</p>
@@ -249,8 +272,8 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
               <div 
                 onClick={(e) => {
                   const rect = e.currentTarget.getBoundingClientRect();
-                  const clickPct = (e.clientX - rect.left) / rect.width;
-                  const dur = duration || 12;
+                  const clickPct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  const dur = (audioRef.current && isFinite(audioRef.current.duration)) ? audioRef.current.duration : (duration || 12);
                   const targetTime = clickPct * dur;
                   setCurrentSec(targetTime);
                   setPlaybackProgress(clickPct * 100);
