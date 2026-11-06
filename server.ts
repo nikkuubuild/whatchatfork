@@ -14,7 +14,9 @@ import {
   getPrimaryVerifyToken,
   generateTenantVerifyToken,
   verifyWebhookToken,
-  verifyMetaHubSignature
+  verifyMetaHubSignature,
+  loadSavedCredentials,
+  saveSavedCredentials
 } from './server/webhookConfig.js';
 import {
   initializeWebhookMetrics,
@@ -59,23 +61,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
-const CREDENTIALS_FILE = path.join(DATA_DIR, 'server_credentials.json');
 const EVENTS_FILE = path.join(DATA_DIR, 'webhook_events.json');
-
-function loadSavedCredentials(): any {
-  try {
-    if (fs.existsSync(CREDENTIALS_FILE)) {
-      return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf-8'));
-    }
-  } catch (_) {}
-  return {};
-}
-
-function saveSavedCredentials(creds: any) {
-  try {
-    fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), 'utf-8');
-  } catch (_) {}
-}
 
 function loadSavedEvents(): WebhookEvent[] {
   try {
@@ -262,55 +248,6 @@ app.post('/api/whatsapp/test-connection', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: error?.message || 'Failed to connect to Meta WhatsApp Cloud API'
-    });
-  }
-});
-
-// Proxy: Send WhatsApp Message (Text, Media, Location, Template)
-app.post('/api/whatsapp/send-message', async (req, res) => {
-  try {
-    const { token, phoneNumberId, messagePayload } = req.body;
-
-    if (!token || !phoneNumberId || !messagePayload) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required parameters (token, phoneNumberId, or messagePayload).'
-      });
-    }
-
-    lastKnownToken = String(token).trim();
-
-    const response = await fetch(
-      `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(messagePayload)
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(response.status).json({
-        success: false,
-        error: data?.error?.message || 'Failed to send message via WhatsApp Cloud API',
-        details: data
-      });
-    }
-
-    return res.json({
-      success: true,
-      data
-    });
-  } catch (error: any) {
-    console.error('Error sending message:', error);
-    return res.status(500).json({
-      success: false,
-      error: error?.message || 'Internal proxy error while sending message'
     });
   }
 });
@@ -751,7 +688,7 @@ app.post('/api/whatsapp/auto-setup', async (req, res) => {
 app.post('/api/whatsapp/save-credentials', async (req, res) => {
   try {
     const creds = req.body;
-    saveSavedCredentials(creds);
+    await saveSavedCredentials(creds);
     if (creds.accessToken) lastKnownToken = creds.accessToken;
     if (creds.appSecret) configuredAppSecret = creds.appSecret;
 

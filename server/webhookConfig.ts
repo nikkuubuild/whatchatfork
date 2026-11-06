@@ -1,8 +1,81 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { db } from './db.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const CREDENTIALS_FILE = path.join(DATA_DIR, 'server_credentials.json');
 
 // Default fallback verify token if none configured in env or database
 export const DEFAULT_VERIFY_TOKEN = 'whatchat_webhook_secret_2026';
+
+export function loadSavedCredentials(): any {
+  try {
+    if (fs.existsSync(CREDENTIALS_FILE)) {
+      return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf-8'));
+    }
+  } catch (_) {}
+  return {};
+}
+
+export async function saveSavedCredentials(creds: any): Promise<void> {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), 'utf-8');
+  } catch (_) {}
+
+  // Also sync into PostgreSQL whatsapp_channels for active/default tenant
+  try {
+    if (creds && creds.accessToken && creds.phoneNumberId) {
+      const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+        || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+      const tenantId = defaultTenant?.id || 'tenant_default_01';
+      const cleanToken = creds.accessToken.trim();
+      const cleanPhoneId = creds.phoneNumberId.trim();
+      const cleanWabaId = creds.wabaId?.trim() || null;
+      const cleanAppId = creds.appId?.trim() || null;
+      const cleanAppSecret = creds.appSecret?.trim() || null;
+      const now = Date.now();
+
+      const existingChannel = (await db.prepare(
+        'SELECT id FROM whatsapp_channels WHERE tenant_id = ? AND phone_number_id = ? LIMIT 1'
+      ).get(tenantId, cleanPhoneId)) as { id: string } | undefined;
+
+      if (existingChannel) {
+        await db.prepare(`
+          UPDATE whatsapp_channels
+          SET access_token = ?, waba_id = COALESCE(?, waba_id), app_id = COALESCE(?, app_id), app_secret = COALESCE(?, app_secret), status = 'active', updated_at = ?
+          WHERE id = ?
+        `).run(cleanToken, cleanWabaId, cleanAppId, cleanAppSecret, now, existingChannel.id);
+      } else {
+        await db.prepare(`
+          INSERT INTO whatsapp_channels (id, tenant_id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, access_token, app_id, app_secret, coexistence_enabled, webhook_verify_token, status, connected_at, updated_at)
+          VALUES (?, ?, 'byo_meta', ?, ?, ?, ?, ?, ?, ?, 1, ?, 'active', ?, ?)
+        `).run(
+          `chan_${now}`,
+          tenantId,
+          cleanWabaId,
+          cleanPhoneId,
+          creds.displayPhoneNumber || cleanPhoneId,
+          creds.verifiedName || 'Business',
+          cleanToken,
+          cleanAppId,
+          cleanAppSecret,
+          DEFAULT_VERIFY_TOKEN,
+          now,
+          now
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[Credentials DB Sync Notice]:', err);
+  }
+}
 
 // Resolves the permanent production base URL without trailing slash.
 // Seamlessly auto-detects domain from incoming HTTP request (Works on Hostinger, AWS, Render, cPanel, Docker, or any custom white-label domain)

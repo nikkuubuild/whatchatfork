@@ -83,9 +83,11 @@ export const WhatsAppApiService = {
     if (type === 'text') {
       payload.type = 'text';
       payload.text = {
-        preview_url: true,
         body: text || ''
       };
+      if (text && /(https?:\/\/[^\s]+)/gi.test(text)) {
+        payload.text.preview_url = true;
+      }
     } else if (type === 'image') {
       payload.type = 'image';
       payload.image = {
@@ -134,12 +136,26 @@ export const WhatsAppApiService = {
       };
     }
 
+    const saasToken = typeof localStorage !== 'undefined' ? localStorage.getItem('whatchat_saas_token') : null;
+
     const res = await fetch('/api/whatsapp/send-message', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(saasToken ? { Authorization: `Bearer ${saasToken}` } : {})
+      },
       body: JSON.stringify({
-        token: credentials.accessToken.trim(),
-        phoneNumberId: credentials.phoneNumberId.trim(),
+        token: credentials.accessToken?.trim(),
+        phoneNumberId: credentials.phoneNumberId?.trim(),
+        wabaId: credentials.wabaId?.trim(),
+        to: cleanTo,
+        type,
+        text,
+        mediaUrl,
+        mediaCaption,
+        filename,
+        location,
+        template,
         messagePayload: payload
       })
     });

@@ -14,7 +14,8 @@ import {
   checkLoginAttempts,
   recordFailedLogin,
   resetLoginAttempts,
-  logAdminAction
+  logAdminAction,
+  verifyToken
 } from './auth.js';
 import {
   getPlatformMetaConfig,
@@ -25,8 +26,11 @@ import {
 import {
   registerTenantSseClient,
   unregisterTenantSseClient,
-  processInboundWebhookPayload
+  processInboundWebhookPayload,
+  broadcastTenantEvent
 } from './multiTenantWebhook.js';
+import { logWebhookEvent } from './webhookDiagnostics.js';
+import { getAppBaseUrl, loadSavedCredentials } from './webhookConfig.js';
 import {
   getBillingConfig,
   saveBillingConfig,
@@ -509,69 +513,199 @@ saasRouter.get('/chats/conversations/:convId/messages', authenticateToken, requi
   res.json({ success: true, messages });
 });
 
-// Send WhatsApp Message (Protected with Quota Check, supports both SaaS & Legacy payload formats)
-saasRouter.post('/whatsapp/send-message', authenticateToken, requireTenant, checkMessageQuota, async (req: AuthenticatedRequest, res) => {
+// Send WhatsApp Message (Protected with Quota Check, supports SaaS, BYO Meta & Direct credentials)
+saasRouter.post('/whatsapp/send-message', async (req: AuthenticatedRequest, res) => {
   try {
-    const tenantId = req.tenantId!;
+    const authHeader = req.headers.authorization;
+    const queryToken = req.query.token as string | undefined;
+    let authUser: any = null;
+    let tenantId: string | undefined = undefined;
+
+    // 1. Authenticate if Bearer token or query token is provided
+    let rawToken: string | null = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      rawToken = authHeader.substring(7).trim();
+    } else if (queryToken) {
+      rawToken = queryToken.trim();
+    }
+
+    if (rawToken) {
+      authUser = verifyToken(rawToken);
+      if (authUser?.tenantId) {
+        tenantId = authUser.tenantId;
+        req.user = authUser;
+        req.tenantId = tenantId;
+      }
+    }
+
+    // 2. Resolve Effective Meta Credentials (supports client credentials, DB channels, server storage, and ENV)
     const bodyPayload = req.body.messagePayload;
-    const to = req.body.to || bodyPayload?.to;
+    let effectiveToken = req.body.token?.trim() || null;
+    let effectivePhoneId = req.body.phoneNumberId?.trim() || null;
+
+    // If tenantId is not yet resolved, try resolving via phoneNumberId in database
+    if (!tenantId && effectivePhoneId) {
+      try {
+        const chan = (await db.prepare('SELECT tenant_id FROM whatsapp_channels WHERE phone_number_id = ? LIMIT 1').get(effectivePhoneId)) as { tenant_id: string } | undefined;
+        if (chan?.tenant_id) {
+          tenantId = chan.tenant_id;
+        }
+      } catch (_) {}
+    }
+
+    // If still no tenantId, fall back to default workspace tenant
+    if (!tenantId) {
+      try {
+        const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+          || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+        tenantId = defaultTenant?.id || 'tenant_default_01';
+      } catch (_) {
+        tenantId = 'tenant_default_01';
+      }
+    }
+    req.tenantId = tenantId;
+
+    // Check quota if tenant exists and has an active subscription plan
+    if (tenantId) {
+      try {
+        const tenantRecord = (await db.prepare('SELECT subscription_status, monthly_message_quota, messages_used_current_cycle FROM tenants WHERE id = ?').get(tenantId)) as any;
+        if (tenantRecord) {
+          if (tenantRecord.subscription_status === 'suspended' || tenantRecord.subscription_status === 'canceled') {
+            return res.status(402).json({
+              success: false,
+              error: 'Subscription is inactive or suspended. Please renew in Billing.'
+            });
+          }
+          if (tenantRecord.monthly_message_quota > 0 && tenantRecord.messages_used_current_cycle >= tenantRecord.monthly_message_quota) {
+            return res.status(402).json({
+              success: false,
+              error: `Monthly message quota limit reached (${tenantRecord.messages_used_current_cycle} / ${tenantRecord.monthly_message_quota}). Please upgrade your plan.`
+            });
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Query active channel in database for tenant if credentials are not explicitly supplied
+    let channel: any = null;
+    if (tenantId) {
+      try {
+        channel = (await db.prepare(`
+          SELECT * FROM whatsapp_channels
+          WHERE tenant_id = ? AND status = 'active'
+          ORDER BY connected_at DESC LIMIT 1
+        `).get(tenantId)) as any;
+      } catch (_) {}
+    }
+
+    if (!effectiveToken && channel?.access_token) {
+      effectiveToken = channel.access_token.trim();
+    }
+    if (!effectivePhoneId && channel?.phone_number_id) {
+      effectivePhoneId = channel.phone_number_id.trim();
+    }
+
+    // Fall back to server saved credentials
+    if (!effectiveToken || !effectivePhoneId) {
+      const saved = loadSavedCredentials();
+      if (!effectiveToken && saved?.accessToken) effectiveToken = saved.accessToken.trim();
+      if (!effectivePhoneId && saved?.phoneNumberId) effectivePhoneId = saved.phoneNumberId.trim();
+    }
+
+    // Fall back to environment variables
+    if (!effectiveToken && process.env.WHATSAPP_ACCESS_TOKEN) {
+      effectiveToken = process.env.WHATSAPP_ACCESS_TOKEN.trim();
+    }
+    if (!effectivePhoneId && process.env.WHATSAPP_PHONE_NUMBER_ID) {
+      effectivePhoneId = process.env.WHATSAPP_PHONE_NUMBER_ID.trim();
+    }
+
+    if (!effectiveToken || !effectivePhoneId) {
+      return res.status(400).json({
+        success: false,
+        error: 'No active WhatsApp Cloud API credentials found. Please configure your Access Token and Phone Number ID in Settings.'
+      });
+    }
+
+    // 3. Resolve Recipient Phone Number
+    const rawTo = req.body.to || bodyPayload?.to;
+    if (!rawTo) {
+      return res.status(400).json({ success: false, error: 'Recipient phone number is required.' });
+    }
+    const cleanTo = String(rawTo).replace(/[^0-9]/g, '');
+    if (!cleanTo || cleanTo.length < 5) {
+      return res.status(400).json({ success: false, error: 'Invalid recipient phone number. Must contain country code and phone digits.' });
+    }
+
     const type = req.body.type || bodyPayload?.type || 'text';
-    const text = req.body.text || bodyPayload?.text?.body;
+    const text = req.body.text || bodyPayload?.text?.body || '';
     const mediaUrl = req.body.mediaUrl;
     const mediaCaption = req.body.mediaCaption;
     const filename = req.body.filename;
     const location = req.body.location;
     const template = req.body.template;
 
-    if (!to) {
-      return res.status(400).json({ success: false, error: 'Recipient phone number is required.' });
-    }
-
-    // Retrieve active WhatsApp channel for this tenant, or fallback to explicit credentials
-    const channel = (await db.prepare(`
-      SELECT * FROM whatsapp_channels
-      WHERE tenant_id = ? AND status = 'active'
-      ORDER BY connected_at DESC LIMIT 1
-    `).get(tenantId)) as any;
-
-    const effectiveToken = channel?.access_token || req.body.token;
-    const effectivePhoneId = channel?.phone_number_id || req.body.phoneNumberId;
-
-    if (!effectiveToken || !effectivePhoneId) {
-      return res.status(400).json({
-        success: false,
-        error: 'No active WhatsApp channel found in this workspace. Please connect WhatsApp in Settings.'
-      });
-    }
-
-    // Build or reuse Meta Cloud API payload
+    // 4. Construct or Normalize Meta Cloud API Payload
     let finalPayload: any = bodyPayload;
-    if (!finalPayload) {
+    if (!finalPayload || typeof finalPayload !== 'object') {
       finalPayload = {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
-        to: String(to).replace(/[^0-9]/g, '')
+        to: cleanTo
       };
 
       if (template) {
         finalPayload.type = 'template';
         finalPayload.template = template;
       } else if (type === 'image' && mediaUrl) {
+        const fullMediaUrl = mediaUrl.startsWith('/') ? `${getAppBaseUrl(req)}${mediaUrl}` : mediaUrl;
         finalPayload.type = 'image';
-        finalPayload.image = { link: mediaUrl, caption: mediaCaption || '' };
+        finalPayload.image = { link: fullMediaUrl, caption: mediaCaption || '' };
+      } else if (type === 'video' && mediaUrl) {
+        const fullMediaUrl = mediaUrl.startsWith('/') ? `${getAppBaseUrl(req)}${mediaUrl}` : mediaUrl;
+        finalPayload.type = 'video';
+        finalPayload.video = { link: fullMediaUrl, caption: mediaCaption || '' };
+      } else if (type === 'audio' && mediaUrl) {
+        const fullMediaUrl = mediaUrl.startsWith('/') ? `${getAppBaseUrl(req)}${mediaUrl}` : mediaUrl;
+        finalPayload.type = 'audio';
+        finalPayload.audio = { link: fullMediaUrl };
       } else if (type === 'document' && mediaUrl) {
+        const fullMediaUrl = mediaUrl.startsWith('/') ? `${getAppBaseUrl(req)}${mediaUrl}` : mediaUrl;
         finalPayload.type = 'document';
-        finalPayload.document = { link: mediaUrl, caption: mediaCaption || '', filename: filename || 'file' };
+        finalPayload.document = { link: fullMediaUrl, caption: mediaCaption || '', filename: filename || 'file' };
       } else if (type === 'location' && location) {
         finalPayload.type = 'location';
         finalPayload.location = location;
       } else {
         finalPayload.type = 'text';
         finalPayload.text = { body: text || '' };
+        if (text && /(https?:\/\/[^\s]+)/gi.test(text)) {
+          finalPayload.text.preview_url = true;
+        }
+      }
+    } else {
+      // Normalize incoming pre-built payload
+      finalPayload.to = cleanTo;
+      finalPayload.messaging_product = 'whatsapp';
+      finalPayload.recipient_type = 'individual';
+
+      // If media link is relative, make it absolute using public URL
+      for (const mType of ['image', 'document', 'audio', 'video'] as const) {
+        if (finalPayload[mType]?.link && String(finalPayload[mType].link).startsWith('/')) {
+          finalPayload[mType].link = `${getAppBaseUrl(req)}${finalPayload[mType].link}`;
+        }
+      }
+
+      // Safeguard preview_url on text payload
+      if (finalPayload.type === 'text' && finalPayload.text?.preview_url) {
+        if (!finalPayload.text.body || !/(https?:\/\/[^\s]+)/gi.test(finalPayload.text.body)) {
+          delete finalPayload.text.preview_url;
+        }
       }
     }
 
-    // Dispatch to Meta Graph API
+    // 5. Dispatch Outbound Message to Meta Graph API
+    console.log(`[WhatsApp Outbound] Dispatching ${finalPayload.type || 'text'} message to ${cleanTo} via Phone ID ${effectivePhoneId}...`);
     const metaRes = await fetch(`https://graph.facebook.com/v21.0/${effectivePhoneId}/messages`, {
       method: 'POST',
       headers: {
@@ -583,6 +717,7 @@ saasRouter.post('/whatsapp/send-message', authenticateToken, requireTenant, chec
 
     const metaData = await metaRes.json();
     if (!metaRes.ok) {
+      console.error(`[WhatsApp Outbound Error] Meta API HTTP ${metaRes.status}:`, JSON.stringify(metaData));
       return res.status(metaRes.status).json({
         success: false,
         error: metaData?.error?.message || 'Meta API rejected message',
@@ -593,46 +728,87 @@ saasRouter.post('/whatsapp/send-message', authenticateToken, requireTenant, chec
     const metaMsgId = metaData.messages?.[0]?.id || `msg_${uuidv4()}`;
     const now = Date.now();
 
-    // Upsert conversation
-    let conv = (await db.prepare('SELECT id FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, finalPayload.to)) as any;
+    // 6. Upsert Conversation in Database
+    let conv = (await db.prepare('SELECT id FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, cleanTo)) as any;
     let convId = conv ? conv.id : uuidv4();
+
+    const previewText = text || (finalPayload.type === 'template' ? `Template: ${template?.name || 'template'}` : `[${type}]`);
 
     if (conv) {
       await db.prepare(`
         UPDATE conversations
         SET last_message_preview = ?, updated_at = ?
         WHERE id = ?
-      `).run(text || `[${type}]`, now, convId);
+      `).run(previewText, now, convId);
     } else {
       const colors = ['#008069', '#128C7E', '#25D366', '#075E54', '#34B7F1'];
       const randomColor = colors[Math.floor(Math.random() * colors.length)];
       await db.prepare(`
         INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-      `).run(convId, tenantId, channel?.id || null, finalPayload.to, finalPayload.to, randomColor, text || `[${type}]`, now, now);
+      `).run(convId, tenantId, channel?.id || null, cleanTo, cleanTo, randomColor, previewText, now, now);
     }
 
-    // Record message in DB
+    // 7. Record Outbound Message in Database
+    const locationJson = location ? JSON.stringify(location) : null;
     await db.prepare(`
-      INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, status, created_at)
-      VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'sent', ?)
-    `).run(uuidv4(), tenantId, convId, metaMsgId, type, text || '', mediaUrl || null, mediaCaption || null, filename || null, now);
+      INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, location_json, status, created_at)
+      VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'sent', ?)
+    `).run(
+      uuidv4(),
+      tenantId,
+      convId,
+      metaMsgId,
+      type,
+      text || '',
+      mediaUrl || null,
+      mediaCaption || null,
+      filename || null,
+      locationJson,
+      now
+    );
 
-    // Increment tenant monthly message usage
-    await db.prepare(`
-      UPDATE tenants
-      SET messages_used_current_cycle = messages_used_current_cycle + 1
-      WHERE id = ?
-    `).run(tenantId);
+    // 8. Increment Tenant Message Usage
+    try {
+      await db.prepare(`
+        UPDATE tenants
+        SET messages_used_current_cycle = messages_used_current_cycle + 1
+        WHERE id = ?
+      `).run(tenantId);
+    } catch (_) {}
 
-    res.json({
+    // 9. Broadcast Outbound Event to SSE Clients & Audit Log
+    try {
+      broadcastTenantEvent(tenantId, {
+        id: metaMsgId,
+        type: 'message',
+        timestamp: now,
+        data: {
+          id: metaMsgId,
+          fromMe: true,
+          to: cleanTo,
+          text: text || previewText,
+          type,
+          status: 'sent',
+          timestamp: now
+        }
+      });
+      await logWebhookEvent({
+        tenantId,
+        eventType: 'outbound_message',
+        payload: { metaMsgId, to: cleanTo, phoneId: effectivePhoneId, type }
+      });
+    } catch (_) {}
+
+    console.log(`[WhatsApp Outbound Success] Message dispatched! WAMID: ${metaMsgId}`);
+    return res.json({
       success: true,
       data: metaData,
       metaMessageId: metaMsgId
     });
   } catch (err: any) {
-    console.error('Error sending message:', err);
-    res.status(500).json({ success: false, error: err?.message || 'Failed to dispatch message' });
+    console.error('[WhatsApp Outbound Exception]:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to dispatch message' });
   }
 });
 
