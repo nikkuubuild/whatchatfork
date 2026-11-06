@@ -625,6 +625,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               onChange={(e) => setAccessToken(e.target.value)}
               className="w-full font-mono px-3 py-2 text-xs rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:border-[#008069]"
             />
+            {/* Guide for Permanent Token */}
+            <div className="mt-1.5 p-2.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-[11px] text-slate-600 dark:text-slate-300">
+              <span className="font-semibold text-slate-800 dark:text-slate-200 block mb-0.5">
+                ⚡ Temporary 24h vs. Permanent Token:
+              </span>
+              <span>Temporary tokens from Meta API Setup expire after 24 hours. For permanent production messaging, generate a System User token from </span>
+              <a href="https://business.facebook.com/settings/system-users" target="_blank" rel="noopener noreferrer" className="text-[#008069] dark:text-[#25D366] font-medium underline inline-flex items-center gap-0.5">
+                Business Settings &gt; System Users
+              </a>
+              <span> with <code className="px-1 py-0.2 bg-slate-200 dark:bg-slate-700 rounded text-[10px] font-mono">whatsapp_business_messaging</code> and expiration set to <b>Never</b>.</span>
+            </div>
           </div>
 
           {/* 1-Click Auto Setup Action Button */}

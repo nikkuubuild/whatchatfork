@@ -10,7 +10,10 @@ import {
   Sparkles,
   Zap,
   Building2,
-  MapPin
+  MapPin,
+  KeyRound,
+  ExternalLink,
+  CheckCircle2
 } from 'lucide-react';
 import { Conversation, ChatMessage, WhatsAppTemplate, WhatsAppCredentials, QuickFile, QuickLocationPreset, QuickPresetsSettings } from '../../types/whatsapp';
 import { MessageBubble } from './MessageBubble';
@@ -42,6 +45,7 @@ interface ChatWindowProps {
   onDeleteLocation: (id: string) => void;
   onReorderLocations: (fromIndex: number, toIndex: number) => void;
   onOpenSettings?: () => void;
+  onSaveCredentials?: (creds: WhatsAppCredentials) => void;
 }
 
 export const ChatWindow: React.FC<ChatWindowProps> = ({
@@ -63,13 +67,19 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   onAddLocation,
   onDeleteLocation,
   onReorderLocations,
-  onOpenSettings
+  onOpenSettings,
+  onSaveCredentials
 }) => {
   const [isAttachmentOpen, setIsAttachmentOpen] = useState(false);
   const [isLocationPickerOpen, setIsLocationPickerOpen] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isTokenExpired, setIsTokenExpired] = useState(false);
+  const [showQuickTokenModal, setShowQuickTokenModal] = useState(false);
+  const [quickTokenInput, setQuickTokenInput] = useState('');
+  const [isUpdatingToken, setIsUpdatingToken] = useState(false);
+  const [tokenUpdateError, setTokenUpdateError] = useState<string | null>(null);
 
   // Quick Files Drawer State
   const [isQuickFilesOpen, setIsQuickFilesOpen] = useState(false);
@@ -97,19 +107,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const handleDispatch = async (newMessage: ChatMessage) => {
     onSendMessage(newMessage);
 
-    // Verify Meta Cloud API credentials exist
-    if (!credentials.accessToken?.trim() || !credentials.phoneNumberId?.trim()) {
-      onUpdateMessageStatus(newMessage.id, 'failed');
-      setErrorMessage(
-        'WhatsApp Cloud API is not configured! Please enter your Meta Access Token and Phone Number ID in Settings to send real WhatsApp messages.'
-      );
-      if (onOpenSettings) {
-        setTimeout(() => onOpenSettings(), 600);
-      }
-      return;
-    }
-
-    // Call Real Meta Cloud API
+    // Call Real Meta Cloud API via server proxy (server will auto-use connected database channel if client state is uninitialized)
     try {
       setErrorMessage(null);
       const res = await WhatsAppApiService.sendMessage({
@@ -129,17 +127,77 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           : undefined
       });
 
-      if (res.success && res.data?.messages?.[0]?.id) {
-        onUpdateMessageStatus(newMessage.id, 'sent', res.data.messages[0].id);
+      const messageId = res.data?.messages?.[0]?.id || res.metaMessageId;
+
+      if (res.success && messageId) {
+        onUpdateMessageStatus(newMessage.id, 'sent', messageId);
         waAudio.playSent();
+        setErrorMessage(null);
+        setIsTokenExpired(false);
       } else {
         onUpdateMessageStatus(newMessage.id, 'failed');
         const detailMsg = res.details?.error?.message || res.error || 'Failed to dispatch via Meta API';
-        setErrorMessage(`Meta API Error: ${detailMsg}`);
+        const expired = res.isTokenExpired || 
+          res.details?.error?.code === 190 || 
+          detailMsg.toLowerCase().includes('expired') || 
+          detailMsg.toLowerCase().includes('oauthexception') ||
+          detailMsg.toLowerCase().includes('code 190');
+
+        if (expired) {
+          setIsTokenExpired(true);
+          setErrorMessage('Meta Access Token Expired (Error 190): Session expired on Meta. Click "Update Token" to paste a fresh or permanent System User token.');
+        } else {
+          setErrorMessage(`Meta API Error: ${detailMsg}`);
+          if (detailMsg.toLowerCase().includes('not configured') || detailMsg.toLowerCase().includes('settings')) {
+            if (onOpenSettings) {
+              setTimeout(() => onOpenSettings(), 800);
+            }
+          }
+        }
       }
     } catch (err: any) {
       onUpdateMessageStatus(newMessage.id, 'failed');
       setErrorMessage(err?.message || 'Network error reaching WhatsApp API');
+    }
+  };
+
+  // Quick Token Submit
+  const handleQuickTokenSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!quickTokenInput.trim()) {
+      setTokenUpdateError('Please enter your Meta Access Token.');
+      return;
+    }
+
+    setIsUpdatingToken(true);
+    setTokenUpdateError(null);
+
+    try {
+      const result = await WhatsAppApiService.updateToken(
+        quickTokenInput.trim(),
+        credentials.phoneNumberId
+      );
+
+      if (result.success && result.credentials) {
+        onSaveCredentials?.(result.credentials);
+        setIsTokenExpired(false);
+        setErrorMessage(null);
+        setShowQuickTokenModal(false);
+        setQuickTokenInput('');
+        waAudio.playReceived();
+
+        // Automatically retry the latest failed message in this conversation if any
+        const latestFailed = [...messages].reverse().find(m => m.fromMe && m.status === 'failed');
+        if (latestFailed) {
+          setTimeout(() => handleDispatch(latestFailed), 300);
+        }
+      } else {
+        setTokenUpdateError(result.error || 'Meta rejected this token. Ensure it is valid and has whatsapp_business_messaging permissions.');
+      }
+    } catch (err: any) {
+      setTokenUpdateError(err?.message || 'Failed to communicate with server.');
+    } finally {
+      setIsUpdatingToken(false);
     }
   };
 
@@ -429,8 +487,48 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         </div>
       </div>
 
+      {/* Prominent Meta Token Expired Warning Banner */}
+      {isTokenExpired && (
+        <div className="bg-red-50 dark:bg-red-950/70 border-b border-red-300 dark:border-red-800 px-3.5 py-2 flex items-center justify-between text-xs text-red-900 dark:text-red-200 animate-in fade-in shrink-0 shadow-xs">
+          <div className="flex items-center gap-2 min-w-0 pr-2">
+            <div className="w-6 h-6 rounded-full bg-red-100 dark:bg-red-900/60 flex items-center justify-center shrink-0">
+              <KeyRound className="w-3.5 h-3.5 text-red-600 dark:text-red-400" />
+            </div>
+            <div className="min-w-0">
+              <div className="font-bold flex items-center gap-1.5 text-red-950 dark:text-red-100">
+                <span>Meta Access Token Expired (Error 190)</span>
+                <span className="text-[10px] px-1.5 py-0.2 rounded bg-red-200 dark:bg-red-900 text-red-800 dark:text-red-300 font-mono font-medium">Session Expired</span>
+              </div>
+              <p className="text-[11px] text-red-800 dark:text-red-300 truncate">
+                Your 24h Meta token expired. Inbound messages work, but outbound messages need a fresh or permanent token.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              onClick={() => {
+                setQuickTokenInput(credentials.accessToken || '');
+                setTokenUpdateError(null);
+                setShowQuickTokenModal(true);
+              }}
+              className="px-2.5 py-1 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg text-xs transition-colors shadow-xs cursor-pointer flex items-center gap-1"
+            >
+              <KeyRound className="w-3 h-3" />
+              <span>Update Token</span>
+            </button>
+            <button
+              onClick={() => setIsTokenExpired(false)}
+              className="p-1 hover:bg-red-100 dark:hover:bg-red-900/40 rounded text-red-500 font-bold ml-1"
+              title="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Warning banner if Meta Cloud API credentials not configured */}
-      {(!credentials.accessToken?.trim() || !credentials.phoneNumberId?.trim()) && (
+      {!isTokenExpired && (!credentials.accessToken?.trim() || !credentials.phoneNumberId?.trim()) && (
         <div className="bg-amber-500/10 dark:bg-amber-950/60 border-b border-amber-500/30 px-3.5 py-2 flex items-center justify-between text-xs text-amber-900 dark:text-amber-200 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
             <ShieldAlert className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
@@ -447,8 +545,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         </div>
       )}
 
-      {/* Error alert banner if Meta API call failed */}
-      {errorMessage && (
+      {/* General error alert banner if Meta API call failed (non-expired) */}
+      {!isTokenExpired && errorMessage && (
         <div className="bg-red-50 dark:bg-red-950/60 border-b border-red-200 dark:border-red-900 px-3 py-1.5 flex items-center justify-between text-xs text-red-800 dark:text-red-200 animate-in fade-in shrink-0">
           <div className="flex items-center gap-1.5">
             <AlertCircle className="w-3.5 h-3.5 text-red-600 shrink-0" />
@@ -549,6 +647,115 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         media={activeMedia}
         onClose={() => setActiveMedia(null)}
       />
+
+      {/* Quick Meta Access Token Renewal Modal */}
+      {showQuickTokenModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in">
+          <div className="bg-white dark:bg-[#202C33] rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 max-w-lg w-full overflow-hidden">
+            {/* Modal Header */}
+            <div className="px-5 py-4 bg-[#008069] dark:bg-[#128C7E] text-white flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-white/20 flex items-center justify-center">
+                  <KeyRound className="w-4 h-4 text-white" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm">Update Meta Access Token</h3>
+                  <p className="text-[11px] text-emerald-100">Restore instant outbound messaging</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowQuickTokenModal(false)}
+                className="w-7 h-7 rounded-full bg-black/10 hover:bg-black/20 flex items-center justify-center text-white text-base transition-colors"
+              >
+                ×
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <form onSubmit={handleQuickTokenSubmit} className="p-5 space-y-4">
+              <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/60 rounded-xl p-3 text-xs text-amber-900 dark:text-amber-200 space-y-1.5">
+                <div className="font-semibold flex items-center gap-1.5">
+                  <ShieldAlert className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+                  <span>Why did this happen?</span>
+                </div>
+                <p className="text-[11px] leading-relaxed text-amber-800 dark:text-amber-300">
+                  Meta's temporary developer token lasts only 24 hours. While webhooks continue receiving customer messages, outbound replies require an active Bearer token.
+                </p>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                    New Meta Access Token
+                  </label>
+                  <a
+                    href="https://developers.facebook.com/apps/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[11px] text-[#008069] dark:text-[#25D366] hover:underline flex items-center gap-0.5"
+                  >
+                    <span>Meta Developer Portal</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <textarea
+                  rows={3}
+                  placeholder="Paste your EAAG... or System User access token here"
+                  value={quickTokenInput}
+                  onChange={(e) => setQuickTokenInput(e.target.value)}
+                  className="w-full font-mono text-xs px-3 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-none focus:border-[#008069] resize-none"
+                  autoFocus
+                />
+              </div>
+
+              {/* Step-by-step guidance for Permanent Token */}
+              <div className="rounded-xl bg-slate-50 dark:bg-slate-800/50 p-3 text-[11px] text-slate-600 dark:text-slate-300 space-y-1 border border-slate-200 dark:border-slate-700/60">
+                <p className="font-semibold text-slate-800 dark:text-slate-200">
+                  💡 Tip: Want a Never-Expiring Token?
+                </p>
+                <p className="text-slate-500 dark:text-slate-400 text-[10.5px]">
+                  Go to <a href="https://business.facebook.com/settings/system-users" target="_blank" rel="noopener noreferrer" className="text-[#008069] dark:text-[#25D366] underline">Meta Business Settings &gt; System Users</a> &rarr; Generate Token &rarr; Select <code className="bg-slate-200 dark:bg-slate-700 px-1 py-0.2 rounded font-mono">whatsapp_business_messaging</code> &rarr; Expiration: <b>Never</b>.
+                </p>
+              </div>
+
+              {tokenUpdateError && (
+                <div className="p-2.5 rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 text-xs text-red-700 dark:text-red-300 flex items-center gap-1.5">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{tokenUpdateError}</span>
+                </div>
+              )}
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-end gap-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowQuickTokenModal(false)}
+                  className="px-4 py-2 text-xs font-semibold rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isUpdatingToken || !quickTokenInput.trim()}
+                  className="px-5 py-2 text-xs font-bold rounded-xl bg-[#008069] hover:bg-[#00705c] dark:bg-[#25D366] dark:hover:bg-[#20ba59] text-white flex items-center gap-1.5 transition-colors disabled:opacity-50 shadow-sm cursor-pointer"
+                >
+                  {isUpdatingToken ? (
+                    <>
+                      <RotateCcw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Validating with Meta...</span>
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      <span>Save &amp; Reconnect</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

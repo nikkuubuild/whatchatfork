@@ -757,10 +757,108 @@ app.post('/api/whatsapp/save-credentials', async (req, res) => {
   }
 });
 
-// Retrieve server-saved credentials on frontend mount
-app.get('/api/whatsapp/credentials', (req, res) => {
-  const creds = loadSavedCredentials();
-  res.json({ success: true, credentials: creds });
+// Quick Update & Validate Meta Access Token (Tests token with Meta Graph API and saves immediately)
+app.post('/api/whatsapp/update-token', async (req, res) => {
+  try {
+    const { token, phoneNumberId } = req.body;
+    if (!token || typeof token !== 'string' || !token.trim()) {
+      return res.status(400).json({ success: false, error: 'A valid Meta access token is required.' });
+    }
+
+    const cleanToken = token.trim();
+    let currentCreds = loadSavedCredentials() || {};
+    const effectivePhoneId = (phoneNumberId || currentCreds?.phoneNumberId || '').trim();
+
+    // Verify token with Meta Graph API
+    let probeUrl = `https://graph.facebook.com/v21.0/me?access_token=${cleanToken}`;
+    if (effectivePhoneId) {
+      probeUrl = `https://graph.facebook.com/v21.0/${effectivePhoneId}?fields=verified_name,display_phone_number,quality_rating,status&access_token=${cleanToken}`;
+    }
+
+    const testRes = await fetch(probeUrl);
+    const testData = await testRes.json();
+
+    if (!testRes.ok) {
+      return res.status(testRes.status).json({
+        success: false,
+        error: testData?.error?.message || 'Meta rejected the new access token',
+        details: testData
+      });
+    }
+
+    // Token is valid! Update credentials object
+    const updatedCreds = {
+      ...currentCreds,
+      accessToken: cleanToken,
+      ...(effectivePhoneId ? { phoneNumberId: effectivePhoneId } : {}),
+      ...(testData.display_phone_number ? { displayPhoneNumber: testData.display_phone_number } : {}),
+      ...(testData.verified_name ? { verifiedName: testData.verified_name } : {}),
+      isConnected: true,
+      lastChecked: Date.now()
+    };
+
+    await saveSavedCredentials(updatedCreds);
+    lastKnownToken = cleanToken;
+
+    return res.json({
+      success: true,
+      message: 'Access token validated and updated successfully!',
+      credentials: updatedCreds,
+      meta: testData
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to update token' });
+  }
+});
+
+// Retrieve server-saved credentials on frontend mount (queries disk, PostgreSQL whatsapp_channels, and ENV)
+app.get('/api/whatsapp/credentials', async (_req, res) => {
+  try {
+    let creds = loadSavedCredentials();
+
+    // If not found on disk, query PostgreSQL whatsapp_channels for active channel
+    if (!creds?.accessToken) {
+      try {
+        const chan = (await db.prepare(`
+          SELECT * FROM whatsapp_channels
+          WHERE access_token IS NOT NULL AND access_token != ''
+          ORDER BY connected_at DESC LIMIT 1
+        `).get()) as any;
+
+        if (chan) {
+          creds = {
+            accessToken: chan.access_token,
+            phoneNumberId: chan.phone_number_id,
+            wabaId: chan.waba_id,
+            appId: chan.app_id,
+            appSecret: chan.app_secret,
+            displayPhoneNumber: chan.display_phone_number,
+            verifiedName: chan.verified_name,
+            webhookVerifyToken: chan.webhook_verify_token,
+            isConnected: Boolean(chan.access_token && chan.phone_number_id)
+          };
+          saveSavedCredentials(creds);
+        }
+      } catch (_) {}
+    }
+
+    // Fall back to environment variables
+    if (!creds?.accessToken && process.env.WHATSAPP_ACCESS_TOKEN) {
+      creds = {
+        ...creds,
+        accessToken: process.env.WHATSAPP_ACCESS_TOKEN.trim(),
+        phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID?.trim() || creds?.phoneNumberId || '',
+        wabaId: process.env.WHATSAPP_WABA_ID?.trim() || creds?.wabaId || '',
+        appId: process.env.WHATSAPP_APP_ID?.trim() || creds?.appId || '',
+        appSecret: process.env.WHATSAPP_APP_SECRET?.trim() || creds?.appSecret || '',
+        isConnected: Boolean(process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID)
+      };
+    }
+
+    return res.json({ success: true, credentials: creds || {} });
+  } catch (err: any) {
+    return res.json({ success: true, credentials: {} });
+  }
 });
 
 // Proxy: Discover / List Phone Numbers for WABA

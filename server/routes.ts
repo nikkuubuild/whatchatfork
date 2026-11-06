@@ -312,7 +312,7 @@ saasRouter.get('/auth/me', authenticateToken, async (req: AuthenticatedRequest, 
     `).get(user.tenantId);
 
     activeChannel = await db.prepare(`
-      SELECT id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, coexistence_enabled, status, connected_at
+      SELECT id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, coexistence_enabled, status, connected_at, access_token
       FROM whatsapp_channels
       WHERE tenant_id = ? AND status = 'active'
       ORDER BY connected_at DESC LIMIT 1
@@ -586,23 +586,49 @@ saasRouter.post('/whatsapp/send-message', async (req: AuthenticatedRequest, res)
       } catch (_) {}
     }
 
-    // Query active channel in database for tenant if credentials are not explicitly supplied
+    // Query active channel in database
     let channel: any = null;
     if (tenantId) {
       try {
         channel = (await db.prepare(`
           SELECT * FROM whatsapp_channels
-          WHERE tenant_id = ? AND status = 'active'
+          WHERE tenant_id = ? AND access_token IS NOT NULL AND access_token != ''
           ORDER BY connected_at DESC LIMIT 1
         `).get(tenantId)) as any;
       } catch (_) {}
     }
 
-    if (!effectiveToken && channel?.access_token) {
-      effectiveToken = channel.access_token.trim();
+    if (!channel && effectivePhoneId) {
+      try {
+        channel = (await db.prepare(`
+          SELECT * FROM whatsapp_channels
+          WHERE phone_number_id = ? AND access_token IS NOT NULL AND access_token != ''
+          ORDER BY connected_at DESC LIMIT 1
+        `).get(effectivePhoneId)) as any;
+      } catch (_) {}
     }
-    if (!effectivePhoneId && channel?.phone_number_id) {
-      effectivePhoneId = channel.phone_number_id.trim();
+
+    if (!channel) {
+      try {
+        channel = (await db.prepare(`
+          SELECT * FROM whatsapp_channels
+          WHERE access_token IS NOT NULL AND access_token != ''
+          ORDER BY connected_at DESC LIMIT 1
+        `).get()) as any;
+      } catch (_) {}
+    }
+
+    if (channel) {
+      if (!effectiveToken && channel.access_token) {
+        effectiveToken = channel.access_token.trim();
+      }
+      if (!effectivePhoneId && channel.phone_number_id) {
+        effectivePhoneId = channel.phone_number_id.trim();
+      }
+      if (channel.tenant_id) {
+        tenantId = channel.tenant_id;
+        req.tenantId = tenantId;
+      }
     }
 
     // Fall back to server saved credentials
@@ -626,6 +652,27 @@ saasRouter.post('/whatsapp/send-message', async (req: AuthenticatedRequest, res)
         error: 'No active WhatsApp Cloud API credentials found. Please configure your Access Token and Phone Number ID in Settings.'
       });
     }
+
+    // Ensure tenantId exists in tenants table to satisfy database foreign keys
+    try {
+      const existingTenant = (await db.prepare('SELECT id FROM tenants WHERE id = ? LIMIT 1').get(tenantId)) as any;
+      if (!existingTenant) {
+        const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+          || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+        if (defaultTenant) {
+          tenantId = defaultTenant.id;
+          req.tenantId = tenantId;
+        } else {
+          const seedId = 'tenant_default_01';
+          await db.prepare(`
+            INSERT INTO tenants (id, name, slug, plan_id, subscription_status, monthly_message_quota, messages_used_current_cycle, created_at)
+            VALUES (?, 'Default Workspace', 'default-workspace', 'plan_growth', 'active', 50000, 0, ?)
+          `).run(seedId, Date.now());
+          tenantId = seedId;
+          req.tenantId = tenantId;
+        }
+      }
+    } catch (_) {}
 
     // 3. Resolve Recipient Phone Number
     const rawTo = req.body.to || bodyPayload?.to;
@@ -718,9 +765,19 @@ saasRouter.post('/whatsapp/send-message', async (req: AuthenticatedRequest, res)
     const metaData = await metaRes.json();
     if (!metaRes.ok) {
       console.error(`[WhatsApp Outbound Error] Meta API HTTP ${metaRes.status}:`, JSON.stringify(metaData));
+      const errorMsg = metaData?.error?.message || 'Meta API rejected message';
+      const isTokenExpired = metaData?.error?.code === 190 || 
+        errorMsg.toLowerCase().includes('expired') || 
+        errorMsg.toLowerCase().includes('oauthexception') ||
+        errorMsg.toLowerCase().includes('session has expired');
+
       return res.status(metaRes.status).json({
         success: false,
-        error: metaData?.error?.message || 'Meta API rejected message',
+        isTokenExpired,
+        errorCode: metaData?.error?.code || metaRes.status,
+        error: isTokenExpired
+          ? `Meta Access Token Expired (Code 190): ${errorMsg}. Please paste a new or permanent System User token in Settings.`
+          : errorMsg,
         details: metaData
       });
     }
@@ -728,77 +785,87 @@ saasRouter.post('/whatsapp/send-message', async (req: AuthenticatedRequest, res)
     const metaMsgId = metaData.messages?.[0]?.id || `msg_${uuidv4()}`;
     const now = Date.now();
 
-    // 6. Upsert Conversation in Database
-    let conv = (await db.prepare('SELECT id FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, cleanTo)) as any;
-    let convId = conv ? conv.id : uuidv4();
-
-    const previewText = text || (finalPayload.type === 'template' ? `Template: ${template?.name || 'template'}` : `[${type}]`);
-
-    if (conv) {
-      await db.prepare(`
-        UPDATE conversations
-        SET last_message_preview = ?, updated_at = ?
-        WHERE id = ?
-      `).run(previewText, now, convId);
-    } else {
-      const colors = ['#008069', '#128C7E', '#25D366', '#075E54', '#34B7F1'];
-      const randomColor = colors[Math.floor(Math.random() * colors.length)];
-      await db.prepare(`
-        INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-      `).run(convId, tenantId, channel?.id || null, cleanTo, cleanTo, randomColor, previewText, now, now);
-    }
-
-    // 7. Record Outbound Message in Database
-    const locationJson = location ? JSON.stringify(location) : null;
-    await db.prepare(`
-      INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, location_json, status, created_at)
-      VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'sent', ?)
-    `).run(
-      uuidv4(),
-      tenantId,
-      convId,
-      metaMsgId,
-      type,
-      text || '',
-      mediaUrl || null,
-      mediaCaption || null,
-      filename || null,
-      locationJson,
-      now
-    );
-
-    // 8. Increment Tenant Message Usage
+    // 6. Upsert Conversation and Message in Database (safeguarded so DB glitches don't mask successful dispatch)
     try {
-      await db.prepare(`
-        UPDATE tenants
-        SET messages_used_current_cycle = messages_used_current_cycle + 1
-        WHERE id = ?
-      `).run(tenantId);
-    } catch (_) {}
+      let conv = (await db.prepare(`
+        SELECT id FROM conversations 
+        WHERE tenant_id = ? AND (customer_phone = ? OR customer_phone = ? OR customer_phone = ?)
+        LIMIT 1
+      `).get(tenantId, cleanTo, `+${cleanTo}`, rawTo)) as any;
+      let convId = conv ? conv.id : uuidv4();
 
-    // 9. Broadcast Outbound Event to SSE Clients & Audit Log
-    try {
-      broadcastTenantEvent(tenantId, {
-        id: metaMsgId,
-        type: 'message',
-        timestamp: now,
-        data: {
-          id: metaMsgId,
-          fromMe: true,
-          to: cleanTo,
-          text: text || previewText,
-          type,
-          status: 'sent',
-          timestamp: now
-        }
-      });
-      await logWebhookEvent({
+      const previewText = text || (finalPayload.type === 'template' ? `Template: ${template?.name || 'template'}` : `[${type}]`);
+
+      if (conv) {
+        await db.prepare(`
+          UPDATE conversations
+          SET last_message_preview = ?, updated_at = ?
+          WHERE id = ?
+        `).run(previewText, now, convId);
+      } else {
+        const colors = ['#008069', '#128C7E', '#25D366', '#075E54', '#34B7F1'];
+        const randomColor = colors[Math.floor(Math.random() * colors.length)];
+        await db.prepare(`
+          INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        `).run(convId, tenantId, channel?.id || null, cleanTo, cleanTo, randomColor, previewText, now, now);
+      }
+
+      // 7. Record Outbound Message in Database
+      const locationJson = location ? JSON.stringify(location) : null;
+      await db.prepare(`
+        INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, location_json, status, created_at)
+        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'sent', ?)
+      `).run(
+        uuidv4(),
         tenantId,
-        eventType: 'outbound_message',
-        payload: { metaMsgId, to: cleanTo, phoneId: effectivePhoneId, type }
-      });
-    } catch (_) {}
+        convId,
+        metaMsgId,
+        type,
+        text || '',
+        mediaUrl || null,
+        mediaCaption || null,
+        filename || null,
+        locationJson,
+        now
+      );
+
+      // 8. Increment Tenant Message Usage
+      try {
+        await db.prepare(`
+          UPDATE tenants
+          SET messages_used_current_cycle = messages_used_current_cycle + 1
+          WHERE id = ?
+        `).run(tenantId);
+      } catch (_) {}
+
+      // 9. Broadcast Outbound Event to SSE Clients & Audit Log
+      try {
+        if (tenantId) {
+          broadcastTenantEvent(tenantId, {
+            id: metaMsgId,
+            type: 'message',
+            timestamp: now,
+            data: {
+              id: metaMsgId,
+              fromMe: true,
+              to: cleanTo,
+              text: text || previewText,
+              type,
+              status: 'sent',
+              timestamp: now
+            }
+          });
+        }
+        await logWebhookEvent({
+          tenantId: tenantId || 'tenant_default_01',
+          eventType: 'outbound_message',
+          payload: { metaMsgId, to: cleanTo, phoneId: effectivePhoneId, type }
+        });
+      } catch (_) {}
+    } catch (dbErr) {
+      console.error('[WhatsApp Outbound DB Sync Error]:', dbErr);
+    }
 
     console.log(`[WhatsApp Outbound Success] Message dispatched! WAMID: ${metaMsgId}`);
     return res.json({

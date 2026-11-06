@@ -43,15 +43,16 @@ export async function saveSavedCredentials(creds: any): Promise<void> {
       const now = Date.now();
 
       const existingChannel = (await db.prepare(
-        'SELECT id FROM whatsapp_channels WHERE tenant_id = ? AND phone_number_id = ? LIMIT 1'
-      ).get(tenantId, cleanPhoneId)) as { id: string } | undefined;
+        'SELECT id FROM whatsapp_channels WHERE tenant_id = ? AND (phone_number_id = ? OR phone_number_id IS NULL) ORDER BY connected_at DESC LIMIT 1'
+      ).get(tenantId, cleanPhoneId)) as { id: string } | undefined
+        || (await db.prepare('SELECT id FROM whatsapp_channels WHERE tenant_id = ? ORDER BY connected_at DESC LIMIT 1').get(tenantId)) as { id: string } | undefined;
 
       if (existingChannel) {
         await db.prepare(`
           UPDATE whatsapp_channels
-          SET access_token = ?, waba_id = COALESCE(?, waba_id), app_id = COALESCE(?, app_id), app_secret = COALESCE(?, app_secret), status = 'active', updated_at = ?
+          SET access_token = ?, phone_number_id = ?, waba_id = COALESCE(?, waba_id), app_id = COALESCE(?, app_id), app_secret = COALESCE(?, app_secret), display_phone_number = COALESCE(?, display_phone_number), verified_name = COALESCE(?, verified_name), status = 'active', updated_at = ?
           WHERE id = ?
-        `).run(cleanToken, cleanWabaId, cleanAppId, cleanAppSecret, now, existingChannel.id);
+        `).run(cleanToken, cleanPhoneId, cleanWabaId, cleanAppId, cleanAppSecret, creds.displayPhoneNumber || null, creds.verifiedName || null, now, existingChannel.id);
       } else {
         await db.prepare(`
           INSERT INTO whatsapp_channels (id, tenant_id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, access_token, app_id, app_secret, coexistence_enabled, webhook_verify_token, status, connected_at, updated_at)

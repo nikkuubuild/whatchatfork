@@ -698,6 +698,7 @@ export default function App() {
                   onDeleteLocation={handleDeleteLocation}
                   onReorderLocations={handleReorderLocations}
                   onOpenSettings={() => setActiveTab('settings')}
+                  onSaveCredentials={handleSaveCredentials}
                 />
               ) : (
                 <div className="hidden md:flex flex-col items-center justify-center h-full w-full bg-[#F0F2F5] dark:bg-[#111B21] text-center p-8 select-none">

@@ -36,6 +36,16 @@ export const WhatsAppApiService = {
     return await res.json();
   },
 
+  // Quickly validate and update Meta Access Token
+  async updateToken(token: string, phoneNumberId?: string): Promise<{ success: boolean; message?: string; error?: string; credentials?: any; details?: any }> {
+    const res = await fetch('/api/whatsapp/update-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token.trim(), phoneNumberId: phoneNumberId?.trim() })
+    });
+    return await res.json();
+  },
+
   // Upload a media file or voice recording to the server proxy
   async uploadMedia(fileOrBlob: Blob | File, filename?: string): Promise<{ url: string; filename: string }> {
     return new Promise((resolve, reject) => {
