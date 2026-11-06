@@ -562,7 +562,7 @@ saasRouter.get('/chats/sync', async (req: AuthenticatedRequest, res) => {
     const msgRows = (await db.prepare(`
       SELECT m.*, c.customer_phone
       FROM messages m
-      JOIN conversations c ON m.conversation_id = c.id
+      LEFT JOIN conversations c ON m.conversation_id = c.id
       WHERE m.tenant_id = ?
       ORDER BY m.created_at ASC
     `).all(tenantId)) as any[];
@@ -581,6 +581,9 @@ saasRouter.get('/chats/sync', async (req: AuthenticatedRequest, res) => {
         try { locationData = JSON.parse(m.location_json); } catch (_) {}
       }
 
+      let safeTs = Number(m.created_at) || Date.now();
+      if (safeTs < 1e12) safeTs *= 1000;
+
       messagesByConv[frontendConvId].push({
         id: m.meta_message_id || m.id,
         metaMessageId: m.meta_message_id || undefined,
@@ -593,7 +596,7 @@ saasRouter.get('/chats/sync', async (req: AuthenticatedRequest, res) => {
         filename: m.filename || undefined,
         location: locationData,
         status: m.status || (m.from_me ? 'sent' : 'read'),
-        timestamp: Number(m.created_at)
+        timestamp: safeTs
       });
     }
 
@@ -603,13 +606,16 @@ saasRouter.get('/chats/sync', async (req: AuthenticatedRequest, res) => {
       const convMsgs = messagesByConv[frontendConvId] || [];
       const lastMsg = convMsgs.length > 0 ? convMsgs[convMsgs.length - 1] : undefined;
 
+      let safeUpdated = Number(c.updated_at || c.created_at) || Date.now();
+      if (safeUpdated < 1e12) safeUpdated *= 1000;
+
       return {
         id: frontendConvId,
         phoneNumber: c.customer_phone.startsWith('+') ? c.customer_phone : `+${c.customer_phone}`,
         name: c.customer_name || c.customer_phone,
         avatarColor: c.avatar_color || '#008069',
         unreadCount: Number(c.unread_count || 0),
-        updatedAt: Number(c.updated_at || c.created_at),
+        updatedAt: safeUpdated,
         lastMessage: lastMsg
       };
     });
@@ -623,6 +629,211 @@ saasRouter.get('/chats/sync', async (req: AuthenticatedRequest, res) => {
   } catch (err: any) {
     console.error('[Chats Sync Error]:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Failed to sync chats' });
+  }
+});
+
+// Batch Upload & Sync Local Chats into Database (Allows any device to back up local chats to cloud)
+saasRouter.post('/chats/upload', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const queryToken = req.query.token as string | undefined;
+    let tenantId: string | undefined = undefined;
+
+    let rawToken: string | null = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      rawToken = authHeader.substring(7).trim();
+    } else if (queryToken) {
+      rawToken = queryToken.trim();
+    }
+
+    if (rawToken) {
+      const authUser = verifyToken(rawToken);
+      if (authUser?.tenantId) {
+        tenantId = authUser.tenantId;
+      }
+    }
+
+    if (!tenantId) {
+      try {
+        const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+          || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+        tenantId = defaultTenant?.id || 'tenant_default_01';
+      } catch (_) {
+        tenantId = 'tenant_default_01';
+      }
+    }
+
+    const { conversations = [], messages = {} } = req.body;
+    let savedConvsCount = 0;
+    let savedMsgsCount = 0;
+
+    // 1. Upsert Conversations
+    for (const c of conversations) {
+      if (!c || !c.phoneNumber) continue;
+      const cleanPhone = String(c.phoneNumber).replace(/[^0-9]/g, '');
+      if (!cleanPhone) continue;
+
+      let existingConv = (await db.prepare(`
+        SELECT id FROM conversations
+        WHERE tenant_id = ? AND (customer_phone = ? OR customer_phone = ? OR id = ?)
+        LIMIT 1
+      `).get(tenantId, cleanPhone, `+${cleanPhone}`, c.id)) as { id: string } | undefined;
+
+      const now = Date.now();
+      let safeUpdatedAt = c.updatedAt ? (c.updatedAt < 1e12 ? c.updatedAt * 1000 : c.updatedAt) : now;
+
+      if (existingConv) {
+        if (c.name && c.name !== cleanPhone && c.name !== `+${cleanPhone}`) {
+          await db.prepare(`
+            UPDATE conversations
+            SET customer_name = ?
+            WHERE id = ?
+          `).run(c.name, existingConv.id);
+        }
+      } else {
+        const convId = uuidv4();
+        await db.prepare(`
+          INSERT INTO conversations (id, tenant_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          convId,
+          tenantId,
+          cleanPhone,
+          c.name || cleanPhone,
+          c.avatarColor || '#008069',
+          c.unreadCount || 0,
+          c.lastMessage?.text || '',
+          safeUpdatedAt,
+          safeUpdatedAt
+        );
+        savedConvsCount++;
+      }
+    }
+
+    // 2. Upsert Messages
+    for (const convId in messages) {
+      const msgList = messages[convId];
+      if (!Array.isArray(msgList) || msgList.length === 0) continue;
+
+      const cleanPhone = String(convId).replace(/^conv_/, '').replace(/[^0-9]/g, '');
+      let dbConv = (await db.prepare(`
+        SELECT id FROM conversations
+        WHERE tenant_id = ? AND (id = ? OR customer_phone = ? OR customer_phone = ?)
+        LIMIT 1
+      `).get(tenantId, convId, cleanPhone, `+${cleanPhone}`)) as { id: string } | undefined;
+
+      if (!dbConv && cleanPhone) {
+        const newConvId = uuidv4();
+        const now = Date.now();
+        await db.prepare(`
+          INSERT INTO conversations (id, tenant_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
+          VALUES (?, ?, ?, ?, ?, 0, '', ?, ?)
+        `).run(newConvId, tenantId, cleanPhone, cleanPhone, '#008069', now, now);
+        dbConv = { id: newConvId };
+        savedConvsCount++;
+      }
+
+      if (!dbConv) continue;
+
+      for (const m of msgList) {
+        if (!m) continue;
+        const metaMsgId = m.metaMessageId || (String(m.id).startsWith('wamid.') ? m.id : null);
+
+        let exists = false;
+        if (metaMsgId) {
+          const check = (await db.prepare('SELECT id FROM messages WHERE meta_message_id = ? AND tenant_id = ?').get(metaMsgId, tenantId)) as any;
+          if (check) exists = true;
+        }
+
+        if (!exists) {
+          let safeTs = Number(m.timestamp) || Date.now();
+          if (safeTs < 1e12) safeTs *= 1000;
+
+          const locJson = m.location ? JSON.stringify(m.location) : null;
+          await db.prepare(`
+            INSERT INTO messages (id, tenant_id, conversation_id, meta_message_id, from_me, type, text, media_url, media_caption, filename, location_json, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            uuidv4(),
+            tenantId,
+            dbConv.id,
+            metaMsgId,
+            m.fromMe ? 1 : 0,
+            m.type || 'text',
+            m.text || '',
+            m.mediaUrl || null,
+            m.mediaCaption || null,
+            m.filename || null,
+            locJson,
+            m.status || (m.fromMe ? 'sent' : 'read'),
+            safeTs
+          );
+          savedMsgsCount++;
+        }
+      }
+    }
+
+    return res.json({
+      success: true,
+      savedConvsCount,
+      savedMsgsCount,
+      message: `Synchronized ${savedMsgsCount} messages across ${savedConvsCount} conversations into PostgreSQL database.`
+    });
+  } catch (err: any) {
+    console.error('[Chats Upload Error]:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to upload chats to database' });
+  }
+});
+
+// Mark conversation as read in database and broadcast to all connected agents
+saasRouter.post('/chats/conversations/:id/read', async (req: AuthenticatedRequest, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const queryToken = req.query.token as string | undefined;
+    let tenantId: string | undefined = undefined;
+
+    let rawToken: string | null = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      rawToken = authHeader.substring(7).trim();
+    } else if (queryToken) {
+      rawToken = queryToken.trim();
+    }
+
+    if (rawToken) {
+      const authUser = verifyToken(rawToken);
+      if (authUser?.tenantId) {
+        tenantId = authUser.tenantId;
+      }
+    }
+
+    if (!tenantId) {
+      const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+        || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+      tenantId = defaultTenant?.id || 'tenant_default_01';
+    }
+
+    const convId = req.params.id;
+    const cleanPhone = convId.replace(/^conv_/, '').replace(/[^0-9]/g, '');
+
+    await db.prepare(`
+      UPDATE conversations
+      SET unread_count = 0
+      WHERE tenant_id = ? AND (id = ? OR customer_phone = ? OR customer_phone = ?)
+    `).run(tenantId, convId, cleanPhone, `+${cleanPhone}`);
+
+    broadcastTenantEvent(tenantId, {
+      id: `read_${convId}_${Date.now()}`,
+      type: 'conversation_read',
+      timestamp: Date.now(),
+      data: {
+        conversationId: convId,
+        cleanPhone
+      }
+    });
+
+    return res.json({ success: true, message: 'Conversation marked as read in database.' });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to mark conversation as read' });
   }
 });
 
@@ -979,7 +1190,7 @@ saasRouter.post('/whatsapp/send-message', async (req: AuthenticatedRequest, res)
         `).run(tenantId);
       } catch (_) {}
 
-      // 9. Broadcast Outbound Event to SSE Clients & Audit Log
+      // 9. Broadcast Outbound Event to SSE Clients & Audit Log (Includes complete payload for instant multi-agent sync)
       try {
         if (tenantId) {
           broadcastTenantEvent(tenantId, {
@@ -989,9 +1200,16 @@ saasRouter.post('/whatsapp/send-message', async (req: AuthenticatedRequest, res)
             data: {
               id: metaMsgId,
               fromMe: true,
+              from: cleanTo,
               to: cleanTo,
-              text: text || previewText,
+              cleanPhone: cleanTo,
+              contactName: cleanTo,
               type,
+              text: { body: text || previewText },
+              caption: mediaCaption || undefined,
+              mediaUrl: mediaUrl || undefined,
+              filename: filename || undefined,
+              location: location || undefined,
               status: 'sent',
               timestamp: now
             }

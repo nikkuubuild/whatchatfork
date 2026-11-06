@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { AndroidHeader } from './components/AndroidHeader';
 import { AndroidBottomNav } from './components/AndroidBottomNav';
 import { ChatList } from './components/Chats/ChatList';
@@ -121,49 +121,125 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // Synchronize full chat history and conversations from server database on mount and login
-  useEffect(() => {
-    const syncHeaders: Record<string, string> = saasToken ? { Authorization: `Bearer ${saasToken}` } : {};
-    fetch(saasToken ? `/api/chats/sync?token=${encodeURIComponent(saasToken)}` : '/api/chats/sync', {
-      headers: syncHeaders
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.success) {
-          if (Array.isArray(data.conversations) && data.conversations.length > 0) {
-            setConversations((prev) => {
-              const mergedMap = new Map<string, Conversation>();
-              prev.forEach((c) => mergedMap.set(c.id, c));
-              data.conversations.forEach((c: Conversation) => mergedMap.set(c.id, { ...mergedMap.get(c.id), ...c }));
-              const mergedList = Array.from(mergedMap.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-              LocalStorageManager.saveConversations(mergedList);
-              return mergedList;
-            });
-          }
+  // Deduplicate and merge local messages with authoritative server messages
+  const mergeChatMessages = (localMsgs: ChatMessage[], serverMsgs: ChatMessage[]): ChatMessage[] => {
+    const result: ChatMessage[] = [...serverMsgs];
+    
+    for (const local of localMsgs) {
+      const isDuplicate = result.some(server => 
+        server.id === local.id ||
+        (local.metaMessageId && (local.metaMessageId === server.id || local.metaMessageId === server.metaMessageId)) ||
+        (server.metaMessageId && (server.metaMessageId === local.id || server.metaMessageId === local.metaMessageId)) ||
+        (local.text && server.text && local.text === server.text && local.fromMe === server.fromMe && Math.abs((local.timestamp || 0) - (server.timestamp || 0)) < 15000)
+      );
+      if (!isDuplicate) {
+        result.push(local);
+      }
+    }
 
-          if (data.messages && typeof data.messages === 'object') {
-            setMessages((prev) => {
-              const mergedMessages: Record<string, ChatMessage[]> = { ...prev };
-              for (const convId in data.messages) {
-                const serverList: ChatMessage[] = data.messages[convId];
-                const localList = mergedMessages[convId] || [];
-                const msgMap = new Map<string, ChatMessage>();
-                localList.forEach((m) => msgMap.set(m.id, m));
-                serverList.forEach((m) => {
-                  msgMap.set(m.id, m);
-                  if (m.metaMessageId) msgMap.set(m.metaMessageId, m);
-                });
-                const combined = Array.from(new Set(msgMap.values())).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-                mergedMessages[convId] = combined;
-              }
-              LocalStorageManager.saveMessages(mergedMessages);
-              return mergedMessages;
+    return result.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  };
+
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [lastSyncTime, setLastSyncTime] = useState<number>(Date.now());
+  const isSyncingRef = useRef<boolean>(false);
+
+  // Synchronize full chat history and conversations from server PostgreSQL database
+  const syncWithServer = useCallback(async (options?: { forceUpload?: boolean }) => {
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
+    setIsSyncing(true);
+
+    try {
+      const syncHeaders: Record<string, string> = saasToken ? { Authorization: `Bearer ${saasToken}` } : {};
+      const res = await fetch(saasToken ? `/api/chats/sync?token=${encodeURIComponent(saasToken)}` : '/api/chats/sync', {
+        headers: syncHeaders
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        if (Array.isArray(data.conversations) && data.conversations.length > 0) {
+          setConversations((prev) => {
+            const mergedMap = new Map<string, Conversation>();
+            prev.forEach((c) => mergedMap.set(c.id, c));
+            data.conversations.forEach((c: Conversation) => {
+              const existing = mergedMap.get(c.id);
+              mergedMap.set(c.id, existing ? { ...existing, ...c, unreadCount: c.unreadCount } : c);
             });
-          }
+            const mergedList = Array.from(mergedMap.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+            LocalStorageManager.saveConversations(mergedList);
+            return mergedList;
+          });
         }
-      })
-      .catch((err) => console.warn('[Chats Sync] Initial sync error:', err));
+
+        if (data.messages && typeof data.messages === 'object') {
+          setMessages((prev) => {
+            const mergedMessages: Record<string, ChatMessage[]> = { ...prev };
+            for (const convId in data.messages) {
+              const serverList: ChatMessage[] = data.messages[convId] || [];
+              const localList = mergedMessages[convId] || [];
+              mergedMessages[convId] = mergeChatMessages(localList, serverList);
+            }
+            LocalStorageManager.saveMessages(mergedMessages);
+            return mergedMessages;
+          });
+        }
+
+        // Auto-upload local conversations/messages to cloud if forceUpload is requested
+        if (options?.forceUpload) {
+          const currentConvs = LocalStorageManager.getConversations();
+          const currentMsgs = LocalStorageManager.getMessages();
+          await fetch('/api/chats/upload', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...syncHeaders
+            },
+            body: JSON.stringify({
+              conversations: currentConvs,
+              messages: currentMsgs
+            })
+          });
+        }
+
+        setLastSyncTime(Date.now());
+      }
+    } catch (err) {
+      console.warn('[Chats Sync] Error communicating with server:', err);
+    } finally {
+      isSyncingRef.current = false;
+      setIsSyncing(false);
+    }
   }, [saasToken]);
+
+  // Synchronize on startup and whenever saasToken changes
+  useEffect(() => {
+    syncWithServer();
+  }, [syncWithServer]);
+
+  // Re-sync whenever browser tab regains focus or network reconnects
+  useEffect(() => {
+    let lastFocusSync = 0;
+    const handleFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusSync > 8000) {
+        lastFocusSync = now;
+        syncWithServer();
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('online', handleFocus);
+    const interval = setInterval(() => {
+      syncWithServer();
+    }, 45000);
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('online', handleFocus);
+      clearInterval(interval);
+    };
+  }, [syncWithServer]);
 
   const handleSaveConversations = (newConvs: Conversation[]) => {
     setConversations(newConvs);
@@ -305,12 +381,16 @@ export default function App() {
       let changed = false;
       for (const convId in copy) {
         const list = copy[convId];
-        const idx = list.findIndex((m) => m.id === msgId || (metaId && m.metaMessageId === metaId));
+        const idx = list.findIndex((m) => 
+          m.id === msgId || 
+          m.metaMessageId === msgId || 
+          (metaId && (m.id === metaId || m.metaMessageId === metaId))
+        );
         if (idx !== -1) {
           list[idx] = {
             ...list[idx],
             status,
-            metaMessageId: metaId || list[idx].metaMessageId
+            metaMessageId: metaId || list[idx].metaMessageId || (msgId.startsWith('wamid.') ? msgId : undefined)
           };
           copy[convId] = [...list];
           changed = true;
@@ -373,55 +453,58 @@ export default function App() {
     processedEventIdsRef.current = ids;
   }, []);
 
-  // Ingest incoming webhook event atomically
+  // Ingest incoming webhook event atomically (supports both inbound customer messages & outbound multi-agent sync)
   const ingestIncomingWebhookEvent = (ev: any) => {
     if (ev.type === 'message') {
       const msgData = ev.data;
-      const senderPhone = String(msgData.from || '').trim();
-      const cleanSender = senderPhone.replace(/[^0-9]/g, '');
+      const isFromMe = Boolean(msgData.fromMe !== undefined ? msgData.fromMe : false);
+      const rawTarget = String(msgData.from || msgData.to || msgData.cleanPhone || '').trim();
+      const cleanSender = rawTarget.replace(/[^0-9]/g, '');
       if (!cleanSender) return;
 
-      const formattedPhone = senderPhone.startsWith('+') ? senderPhone : `+${senderPhone}`;
-      const senderName = msgData.contactName || formattedPhone;
+      const formattedPhone = rawTarget.startsWith('+') ? rawTarget : `+${rawTarget}`;
+      const senderName = isFromMe 
+        ? formattedPhone 
+        : (msgData.contactName || formattedPhone);
 
       // Extract message type and payload
       let type: ChatMessage['type'] = 'text';
-      let text = msgData.text?.body || '';
+      let text = typeof msgData.text === 'object' ? (msgData.text?.body || '') : (msgData.text || '');
       let mediaUrl: string | undefined = undefined;
       let fileName: string | undefined = undefined;
       let locationData: any = undefined;
 
       if (msgData.type === 'image') {
         type = 'image';
-        text = msgData.image?.caption || '';
+        text = msgData.image?.caption || msgData.caption || '';
         mediaUrl = msgData.image?.id 
           ? `/api/whatsapp/media/${msgData.image.id}` 
-          : resolveMediaUrl(msgData.image?.url);
+          : resolveMediaUrl(msgData.image?.url || msgData.mediaUrl);
       } else if (msgData.type === 'video') {
         type = 'video';
-        text = msgData.video?.caption || '';
+        text = msgData.video?.caption || msgData.caption || '';
         mediaUrl = msgData.video?.id 
           ? `/api/whatsapp/media/${msgData.video.id}` 
-          : resolveMediaUrl(msgData.video?.url);
+          : resolveMediaUrl(msgData.video?.url || msgData.mediaUrl);
       } else if (msgData.type === 'audio') {
         type = 'audio';
-        text = msgData.audio?.caption || 'Voice message';
+        text = msgData.audio?.caption || msgData.caption || 'Voice message';
         mediaUrl = msgData.audio?.id 
           ? `/api/whatsapp/media/${msgData.audio.id}` 
-          : resolveMediaUrl(msgData.audio?.url);
+          : resolveMediaUrl(msgData.audio?.url || msgData.mediaUrl);
       } else if (msgData.type === 'document') {
         type = 'document';
-        text = msgData.document?.caption || msgData.document?.filename || 'Document';
-        fileName = msgData.document?.filename;
+        text = msgData.document?.caption || msgData.caption || msgData.document?.filename || msgData.filename || 'Document';
+        fileName = msgData.document?.filename || msgData.filename;
         mediaUrl = msgData.document?.id 
           ? `/api/whatsapp/media/${msgData.document.id}` 
-          : resolveMediaUrl(msgData.document?.url);
+          : resolveMediaUrl(msgData.document?.url || msgData.mediaUrl);
       } else if (msgData.type === 'sticker') {
         type = 'sticker';
         text = 'Sticker';
         mediaUrl = msgData.sticker?.id 
           ? `/api/whatsapp/media/${msgData.sticker.id}` 
-          : resolveMediaUrl(msgData.sticker?.url);
+          : resolveMediaUrl(msgData.sticker?.url || msgData.mediaUrl);
       } else if (msgData.type === 'location') {
         type = 'location';
         const loc = msgData.location;
@@ -435,7 +518,7 @@ export default function App() {
       } else if (!text && msgData.caption) {
         text = msgData.caption;
       } else if (!text) {
-        text = 'New incoming message';
+        text = isFromMe ? 'Outgoing message' : 'New incoming message';
       }
 
       const msgId = msgData.id || `inc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -451,8 +534,6 @@ export default function App() {
           safeTimestamp = rawTs.length === 10 ? parsed * 1000 : parsed;
         }
       }
-
-      const isFromMe = Boolean(msgData.fromMe !== undefined ? msgData.fromMe : false);
 
       setConversations((prevConvs) => {
         const existing = prevConvs.find(
@@ -478,7 +559,7 @@ export default function App() {
         // Atomically update messages for this conversation
         setMessages((prevMsgs) => {
           const list = prevMsgs[convId] || [];
-          if (list.some((m) => m.id === msgId || (msgData.id && m.metaMessageId === msgData.id))) {
+          if (list.some((m) => m.id === msgId || (msgData.id && (m.id === msgData.id || m.metaMessageId === msgData.id)))) {
             return prevMsgs;
           }
           const updated = {
@@ -537,6 +618,21 @@ export default function App() {
       if (statusData.id && statusData.status) {
         handleUpdateMessageStatus(statusData.id, statusData.status);
       }
+    } else if (ev.type === 'conversation_read') {
+      const readData = ev.data;
+      const targetConvId = readData?.conversationId;
+      const targetCleanPhone = readData?.cleanPhone;
+      setConversations((prev) => {
+        const updated = prev.map((c) => {
+          const cPhone = c.phoneNumber.replace(/[^0-9]/g, '');
+          if (c.id === targetConvId || (targetCleanPhone && cPhone === targetCleanPhone)) {
+            return { ...c, unreadCount: 0 };
+          }
+          return c;
+        });
+        LocalStorageManager.saveConversations(updated);
+        return updated;
+      });
     }
   };
 
@@ -557,6 +653,7 @@ export default function App() {
 
         eventSource.onopen = () => {
           console.log('[SSE] Real-time stream connected to server');
+          syncWithServer();
         };
 
         eventSource.onmessage = (event) => {
@@ -735,12 +832,21 @@ export default function App() {
               <ChatList
                 conversations={conversations}
                 activeConversationId={activeConversationId}
+                isSyncing={isSyncing}
+                onRefreshSync={() => syncWithServer()}
                 onSelectConversation={(id) => {
                   setActiveConversationId(id);
                   const updated = conversations.map((c) =>
                     c.id === id ? { ...c, unreadCount: 0 } : c
                   );
                   handleSaveConversations(updated);
+
+                  // Sync read state to database and broadcast to other devices
+                  const syncHeaders: Record<string, string> = saasToken ? { Authorization: `Bearer ${saasToken}` } : {};
+                  fetch(`/api/chats/conversations/${encodeURIComponent(id)}/read`, {
+                    method: 'POST',
+                    headers: syncHeaders
+                  }).catch(() => {});
                 }}
                 onNewChat={handleNewChat}
               />
@@ -837,6 +943,10 @@ export default function App() {
               onOpenContacts={() => setIsContactsModalOpen(true)}
               onOpenSuperAdmin={isSuperAdmin ? () => setIsSuperAdminOpen(true) : undefined}
               onLogout={handleLogout}
+              onSyncChats={() => syncWithServer()}
+              onUploadChats={() => syncWithServer({ forceUpload: true })}
+              isSyncing={isSyncing}
+              lastSyncTime={lastSyncTime}
             />
           </div>
         )}

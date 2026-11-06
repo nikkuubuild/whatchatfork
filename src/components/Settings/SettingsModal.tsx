@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Key, 
   Smartphone, 
@@ -33,7 +33,11 @@ import {
   Eye,
   EyeOff,
   Activity,
-  Server
+  Server,
+  Database,
+  Download,
+  Upload,
+  Cloud
 } from 'lucide-react';
 import { WhatsAppCredentials, QuickPresetsSettings } from '../../types/whatsapp';
 import { WhatsAppApiService } from '../../services/whatsappApi';
@@ -53,6 +57,10 @@ interface SettingsModalProps {
   onOpenContacts?: () => void;
   onOpenSuperAdmin?: () => void;
   onLogout?: () => void;
+  onSyncChats?: () => void;
+  onUploadChats?: () => void;
+  isSyncing?: boolean;
+  lastSyncTime?: number;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -69,7 +77,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onOpenBilling,
   onOpenContacts,
   onOpenSuperAdmin,
-  onLogout
+  onLogout,
+  onSyncChats,
+  onUploadChats,
+  isSyncing = false,
+  lastSyncTime
 }) => {
   const [appId, setAppId] = useState(credentials.appId || '');
   const [appSecret, setAppSecret] = useState(credentials.appSecret || '');
@@ -350,6 +362,79 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     alert('Credentials saved to local storage.');
   };
 
+  const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleExportBackup = () => {
+    try {
+      const convs = localStorage.getItem('whatchat_conversations') || '[]';
+      const msgs = localStorage.getItem('whatchat_messages') || '{}';
+      const tpls = localStorage.getItem('whatchat_templates') || '[]';
+      const backupData = {
+        exportedAt: new Date().toISOString(),
+        version: '2.0.0',
+        conversations: JSON.parse(convs),
+        messages: JSON.parse(msgs),
+        templates: JSON.parse(tpls)
+      };
+      const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `whatchat_cloud_backup_${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setSyncStatusMsg('Chat history backup downloaded successfully.');
+    } catch (e: any) {
+      alert('Failed to export backup: ' + e.message);
+    }
+  };
+
+  const handleImportBackup = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      if (!data.conversations && !data.messages) {
+        alert('Invalid backup file. Must contain conversations or messages.');
+        return;
+      }
+
+      setSyncStatusMsg('Uploading imported backup to PostgreSQL database...');
+      const saasToken = typeof localStorage !== 'undefined' ? localStorage.getItem('whatchat_saas_token') : null;
+      const syncHeaders: Record<string, string> = saasToken ? { Authorization: `Bearer ${saasToken}` } : {};
+
+      const res = await fetch('/api/chats/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...syncHeaders
+        },
+        body: JSON.stringify({
+          conversations: data.conversations || [],
+          messages: data.messages || {}
+        })
+      });
+
+      const resJson = await res.json();
+      if (resJson.success) {
+        setSyncStatusMsg(`Successfully uploaded to PostgreSQL database: ${resJson.message}`);
+        if (onSyncChats) onSyncChats();
+      } else {
+        alert('Server upload error: ' + (resJson.error || 'Failed to upload'));
+      }
+    } catch (err: any) {
+      alert('Failed to parse backup file: ' + err.message);
+    } finally {
+      if (importFileInputRef.current) importFileInputRef.current.value = '';
+    }
+  };
+
   const handleCopy = (text: string, type: 'webhook' | 'verify') => {
     navigator.clipboard.writeText(text);
     if (type === 'webhook') {
@@ -517,6 +602,102 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <LogOut className="w-4 h-4" />
                   </button>
                 )}
+              </div>
+            </div>
+
+            {/* 5. PostgreSQL Cloud Database & Multi-Device Sync Card */}
+            <div className="bg-white dark:bg-[#1F2C34] rounded-2xl p-4 shadow-xs border border-slate-200 dark:border-slate-800 flex flex-col justify-between space-y-3 sm:col-span-2">
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                    <Database className="w-4 h-4 text-[#008069] dark:text-[#25D366]" />
+                    PostgreSQL Cloud Database & Multi-Device Sync
+                  </span>
+                  <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[10px] font-bold">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    Live & Synchronized
+                  </span>
+                </div>
+                <p className="text-slate-500 dark:text-slate-400 text-[11px] leading-relaxed">
+                  Every sent and received message, voice note, photo, document, and delivery status is permanently saved in the PostgreSQL database. Multi-agent logins and multiple devices stay automatically up-to-date in real-time.
+                </p>
+                {syncStatusMsg && (
+                  <p className="text-[11px] font-medium text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 p-2 rounded-lg">
+                    {syncStatusMsg}
+                  </p>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
+                {/* 1. Sync Now */}
+                <button
+                  onClick={() => {
+                    if (onSyncChats) {
+                      onSyncChats();
+                      setSyncStatusMsg('Downloaded and refreshed all chats from cloud database.');
+                    }
+                  }}
+                  disabled={isSyncing}
+                  className="py-2 px-3 bg-[#008069] hover:bg-[#00705a] text-white font-bold rounded-xl text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                  title="Download and refresh conversations from server"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                  <span>{isSyncing ? 'Syncing...' : 'Sync Cloud'}</span>
+                </button>
+
+                {/* 2. Upload to Cloud */}
+                <button
+                  onClick={() => {
+                    if (onUploadChats) {
+                      onUploadChats();
+                      setSyncStatusMsg('Uploaded local conversation history to PostgreSQL database.');
+                    }
+                  }}
+                  disabled={isSyncing}
+                  className="py-2 px-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-bold rounded-xl text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                  title="Upload all local conversations & messages to PostgreSQL"
+                >
+                  <Upload className="w-3.5 h-3.5 text-[#008069] dark:text-[#25D366]" />
+                  <span>Upload Local</span>
+                </button>
+
+                {/* 3. Export JSON Backup */}
+                <button
+                  onClick={handleExportBackup}
+                  className="py-2 px-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-bold rounded-xl text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  title="Export conversations and messages as a JSON backup file"
+                >
+                  <Download className="w-3.5 h-3.5 text-blue-500" />
+                  <span>Export JSON</span>
+                </button>
+
+                {/* 4. Import JSON Backup */}
+                <button
+                  onClick={() => importFileInputRef.current?.click()}
+                  className="py-2 px-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-bold rounded-xl text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  title="Import a JSON backup and save directly into PostgreSQL"
+                >
+                  <FileText className="w-3.5 h-3.5 text-amber-500" />
+                  <span>Import JSON</span>
+                </button>
+
+                <input
+                  type="file"
+                  ref={importFileInputRef}
+                  onChange={handleImportBackup}
+                  accept=".json,application/json"
+                  className="hidden"
+                />
+              </div>
+
+              <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1 border-t border-slate-100 dark:border-slate-800/80">
+                <span className="flex items-center gap-1">
+                  <Cloud className="w-3 h-3 text-[#008069]" />
+                  PostgreSQL multi-tenant persistence enabled
+                </span>
+                <span>
+                  {lastSyncTime ? `Last sync: ${new Date(lastSyncTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Auto-sync active'}
+                </span>
               </div>
             </div>
           </div>

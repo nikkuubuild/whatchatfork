@@ -194,8 +194,13 @@ export async function processInboundWebhookPayload(body: any, explicitTenantId?:
               textContent = `[${msg.type} message]`;
             }
 
-            // Atomically upsert conversation
-            let conv = (await db.prepare('SELECT id, unread_count FROM conversations WHERE tenant_id = ? AND customer_phone = ?').get(tenantId, senderPhone)) as {
+            // Atomically upsert conversation (handles clean digits, with or without leading +)
+            const cleanSenderPhone = String(senderPhone || '').replace(/[^0-9]/g, '');
+            let conv = (await db.prepare(`
+              SELECT id, unread_count FROM conversations 
+              WHERE tenant_id = ? AND (customer_phone = ? OR customer_phone = ? OR customer_phone = ?)
+              LIMIT 1
+            `).get(tenantId, cleanSenderPhone, `+${cleanSenderPhone}`, senderPhone)) as {
               id: string;
               unread_count: number;
             } | undefined;
@@ -216,7 +221,7 @@ export async function processInboundWebhookPayload(body: any, explicitTenantId?:
               await db.prepare(`
                 INSERT INTO conversations (id, tenant_id, channel_id, customer_phone, customer_name, avatar_color, unread_count, last_message_preview, updated_at, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-              `).run(convId, tenantId, channelId, senderPhone, senderName, randomColor, textContent, msgTimestamp, msgTimestamp);
+              `).run(convId, tenantId, channelId, cleanSenderPhone, senderName, randomColor, textContent, msgTimestamp, msgTimestamp);
             }
 
             // Insert Message
@@ -229,18 +234,32 @@ export async function processInboundWebhookPayload(body: any, explicitTenantId?:
             await logWebhookEvent({
               tenantId,
               eventType: 'inbound_message',
-              payload: { msgId, from: senderPhone, type: msg.type }
+              payload: { msgId, from: cleanSenderPhone, type: msg.type }
             });
 
-            // Broadcast isolated SSE event to this tenant
+            // Broadcast isolated SSE event to this tenant with full media metadata
+            let parsedLoc = undefined;
+            if (locationJson) {
+              try { parsedLoc = JSON.parse(locationJson); } catch (_) {}
+            }
+
             broadcastTenantEvent(tenantId, {
               id: msgId,
               type: 'message',
               timestamp: msgTimestamp,
               data: {
                 ...msg,
+                from: cleanSenderPhone,
+                cleanPhone: cleanSenderPhone,
                 contactName: senderName,
-                phoneNumberId
+                phoneNumberId,
+                fromMe: false,
+                mediaUrl: mediaUrl || undefined,
+                mediaCaption: mediaCaption || undefined,
+                caption: mediaCaption || undefined,
+                filename: filename || undefined,
+                location: parsedLoc,
+                status: 'read'
               }
             });
           } catch (msgErr) {

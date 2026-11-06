@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Search, Plus, Pin, Mic, Image, FileText, CheckCheck, UserPlus, X, Video, MapPin, Smile } from 'lucide-react';
+import { Search, Plus, Pin, Mic, Image, FileText, CheckCheck, UserPlus, X, Video, MapPin, Smile, Cloud, RefreshCw } from 'lucide-react';
 import { Conversation, ChatMessage } from '../../types/whatsapp';
 
 interface ChatListProps {
@@ -7,13 +7,17 @@ interface ChatListProps {
   activeConversationId: string | null;
   onSelectConversation: (id: string) => void;
   onNewChat: (phoneNumber: string, name: string) => void;
+  isSyncing?: boolean;
+  onRefreshSync?: () => void;
 }
 
 export const ChatList: React.FC<ChatListProps> = ({
   conversations,
   activeConversationId,
   onSelectConversation,
-  onNewChat
+  onNewChat,
+  isSyncing = false,
+  onRefreshSync
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewChatModal, setShowNewChatModal] = useState(false);
@@ -104,9 +108,9 @@ export const ChatList: React.FC<ChatListProps> = ({
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-[#111B21] border-r border-slate-200 dark:border-slate-800 transition-colors select-none relative">
-      {/* Search Header */}
-      <div className="p-2.5 bg-white dark:bg-[#111B21] border-b border-slate-100 dark:border-slate-800">
-        <div className="relative flex items-center bg-slate-100 dark:bg-[#202C33] rounded-xl px-3 py-1.5 focus-within:ring-1 focus-within:ring-[#008069]">
+      {/* Search & Cloud Sync Header */}
+      <div className="p-2.5 bg-white dark:bg-[#111B21] border-b border-slate-100 dark:border-slate-800 flex items-center gap-2">
+        <div className="relative flex-1 flex items-center bg-slate-100 dark:bg-[#202C33] rounded-xl px-3 py-1.5 focus-within:ring-1 focus-within:ring-[#008069]">
           <Search className="w-4 h-4 text-slate-400 mr-2 shrink-0" />
           <input
             type="text"
@@ -121,6 +125,25 @@ export const ChatList: React.FC<ChatListProps> = ({
             </button>
           )}
         </div>
+
+        {onRefreshSync && (
+          <button
+            onClick={onRefreshSync}
+            disabled={isSyncing}
+            className={`p-2 rounded-xl transition-all flex items-center justify-center shrink-0 ${
+              isSyncing 
+                ? 'bg-emerald-50 dark:bg-emerald-950/30 text-[#008069] dark:text-[#25D366] cursor-wait' 
+                : 'text-slate-500 hover:text-[#008069] dark:text-slate-400 dark:hover:text-[#25D366] hover:bg-slate-100 dark:hover:bg-[#202C33]'
+            }`}
+            title={isSyncing ? 'Syncing chats with database...' : 'Cloud Synced (PostgreSQL Database). Click to refresh.'}
+          >
+            {isSyncing ? (
+              <RefreshCw className="w-4 h-4 animate-spin text-[#008069] dark:text-[#25D366]" />
+            ) : (
+              <Cloud className="w-4 h-4 text-[#008069] dark:text-[#25D366]" />
+            )}
+          </button>
+        )}
       </div>
 
       {/* Conversations Scroll List */}
