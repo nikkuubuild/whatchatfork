@@ -87,11 +87,12 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
   // In-app media lightbox viewer
   const [activeMedia, setActiveMedia] = useState<{
-    type: 'image' | 'document' | 'video';
+    type: 'image' | 'document' | 'video' | 'audio';
     url: string;
     caption?: string;
     filename?: string;
     fileSize?: number;
+    mimeType?: string;
     senderName?: string;
     timestamp?: number;
   } | null>(null);

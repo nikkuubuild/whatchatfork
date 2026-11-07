@@ -57,8 +57,15 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 if (!fs.existsSync(DIST_UPLOADS_DIR)) {
   fs.mkdirSync(DIST_UPLOADS_DIR, { recursive: true });
 }
-app.use('/uploads', express.static(UPLOADS_DIR));
-app.use('/uploads', express.static(DIST_UPLOADS_DIR));
+const uploadStaticOptions = {
+  setHeaders: (res: express.Response) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+};
+app.use('/uploads', express.static(UPLOADS_DIR, uploadStaticOptions));
+app.use('/uploads', express.static(DIST_UPLOADS_DIR, uploadStaticOptions));
 app.get('/uploads/*', (req, res) => {
   res.status(404).send('Upload file not found');
 });
@@ -370,7 +377,24 @@ app.post('/api/whatsapp/upload-local-media', async (req, res) => {
     const cleanBase64 = base64Data.replace(/^data:[^;]+;base64,/, '');
     const buffer = Buffer.from(cleanBase64, 'base64');
 
-    const ext = path.extname(filename || '') || (mimeType.includes('audio') ? '.webm' : mimeType.includes('image') ? '.jpg' : mimeType.includes('pdf') ? '.pdf' : '.bin');
+    // Determine file extension from filename first, then MIME type
+    const mimeToExt: Record<string, string> = {
+      'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+      'image/webp': '.webp', 'image/svg+xml': '.svg', 'image/bmp': '.bmp', 'image/heic': '.heic',
+      'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm', 'video/x-msvideo': '.avi',
+      'video/3gpp': '.3gp', 'video/ogg': '.ogv',
+      'audio/ogg': '.ogg', 'audio/opus': '.opus', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a',
+      'audio/wav': '.wav', 'audio/webm': '.webm', 'audio/aac': '.aac', 'audio/x-m4a': '.m4a',
+      'application/pdf': '.pdf', 'application/msword': '.doc',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+      'application/vnd.ms-excel': '.xls',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+      'application/vnd.ms-powerpoint': '.ppt',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+      'application/zip': '.zip', 'application/x-zip-compressed': '.zip',
+      'text/plain': '.txt', 'text/csv': '.csv'
+    };
+    const ext = path.extname(filename || '') || mimeToExt[mimeType] || '.bin';
     const safeName = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}${ext}`;
     const filePath = path.join(UPLOADS_DIR, safeName);
     fs.writeFileSync(filePath, buffer);
@@ -433,6 +457,8 @@ const handleMediaProxy = async (req: express.Request, res: express.Response) => 
         res.setHeader('Content-Length', fileStat.size);
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
         const readStream = fs.createReadStream(dataCacheFile);
         return readStream.pipe(res);
       } catch (_) {}
@@ -528,6 +554,8 @@ const handleMediaProxy = async (req: express.Request, res: express.Response) => 
     res.setHeader('Content-Length', buffer.length);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     return res.send(buffer);
   } catch (err: any) {
     console.error('Error proxying WhatsApp media:', err);
