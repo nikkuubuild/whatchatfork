@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { ChatMessage } from '../../types/whatsapp';
 import { resolveMediaUrl } from '../../utils/mediaResolver';
+import { formatMessageTime } from '../../utils/dateFormatter';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -59,15 +60,16 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Status icon component
-  const renderStatus = () => {
+  const renderStatus = (isWhite = false) => {
     if (!fromMe) return null;
+    const tickClass = isWhite ? 'text-white/90' : 'text-slate-400';
     switch (status) {
       case 'sending':
-        return <Clock className="w-3.5 h-3.5 text-slate-400 inline ml-1" />;
+        return <Clock className={`w-3.5 h-3.5 inline ml-1 ${tickClass}`} />;
       case 'sent':
-        return <Check className="w-3.5 h-3.5 text-slate-400 inline ml-1" />;
+        return <Check className={`w-3.5 h-3.5 inline ml-1 ${tickClass}`} />;
       case 'delivered':
-        return <CheckCheck className="w-3.5 h-3.5 text-slate-400 inline ml-1" />;
+        return <CheckCheck className={`w-3.5 h-3.5 inline ml-1 ${tickClass}`} />;
       case 'read':
         return <CheckCheck className="w-3.5 h-3.5 text-[#53BDEB] inline ml-1" />;
       case 'failed':
@@ -83,15 +85,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     }
   };
 
-  const formatTime = (ts: any) => {
-    if (!ts) return '';
-    let num = typeof ts === 'number' ? ts : parseInt(String(ts), 10);
-    if (isNaN(num)) return '';
-    if (num < 1e12) num *= 1000;
-    const d = new Date(num);
-    if (isNaN(d.getTime())) return '';
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
+  const formatTime = (ts: any) => formatMessageTime(ts);
 
   const formatAudioTime = (sec: number) => {
     const m = Math.floor(sec / 60);
@@ -181,15 +175,19 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     return () => clearInterval(interval);
   }, [isPlaying, duration, playbackSpeed]);
 
+  const isImageOnly = type === 'image' && !mediaCaption && !imageError;
+
   return (
     <div className={`flex w-full my-1.5 px-2.5 ${fromMe ? 'justify-end' : 'justify-start'}`}>
       <div
-        className={`relative max-w-[88%] sm:max-w-[72%] rounded-2xl px-3 py-2 shadow-xs transition-colors ${
+        className={`relative max-w-[88%] sm:max-w-[72%] rounded-2xl shadow-xs transition-colors ${
           type === 'sticker'
             ? 'bg-transparent shadow-none px-1 py-1'
+            : isImageOnly
+            ? 'p-1 rounded-2xl ' + (fromMe ? 'bg-[#E7FFDB] dark:bg-[#005C4B] text-slate-900 dark:text-slate-100 rounded-tr-xs' : 'bg-white dark:bg-[#202C33] text-slate-900 dark:text-slate-100 rounded-tl-xs border border-black/5 dark:border-white/5')
             : fromMe
-            ? 'bg-[#E7FFDB] dark:bg-[#005C4B] text-slate-900 dark:text-slate-100 rounded-tr-xs'
-            : 'bg-white dark:bg-[#202C33] text-slate-900 dark:text-slate-100 rounded-tl-xs border border-black/5 dark:border-white/5'
+            ? 'bg-[#E7FFDB] dark:bg-[#005C4B] text-slate-900 dark:text-slate-100 rounded-tr-xs px-3 py-2'
+            : 'bg-white dark:bg-[#202C33] text-slate-900 dark:text-slate-100 rounded-tl-xs border border-black/5 dark:border-white/5 px-3 py-2'
         }`}
       >
         {/* Template Header Badge if template */}
@@ -206,9 +204,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           </p>
         )}
 
-        {/* 2. IMAGE MESSAGE */}
+        {/* 2. IMAGE MESSAGE (WhatsApp Standard In-Chat Presentation & Fullscreen Lightbox) */}
         {type === 'image' && (
-          <div className="space-y-1.5 -mx-1 -mt-0.5">
+          <div className="space-y-1">
             {imageError ? (
               <div 
                 onClick={() => onOpenMedia?.({
@@ -218,14 +216,14 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                   timestamp,
                   senderName: fromMe ? 'You' : 'Customer'
                 })}
-                className="relative rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800/80 p-3.5 min-w-[210px] max-w-sm flex flex-col items-center justify-center text-center gap-2 border border-slate-200 dark:border-slate-700/60 cursor-pointer"
+                className="relative rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800/90 p-4 min-w-[220px] max-w-sm flex flex-col items-center justify-center text-center gap-2 border border-slate-200 dark:border-slate-700 cursor-pointer shadow-xs"
               >
-                <div className="w-9 h-9 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center text-slate-500 dark:text-slate-400">
-                  <ImageOff className="w-4 h-4" />
+                <div className="w-10 h-10 rounded-full bg-[#008069]/10 dark:bg-[#25D366]/20 flex items-center justify-center text-[#008069] dark:text-[#25D366]">
+                  <ImageIcon className="w-5 h-5" />
                 </div>
-                <div className="text-xs text-slate-600 dark:text-slate-300">
+                <div className="text-xs text-slate-700 dark:text-slate-200">
                   <span className="font-semibold block truncate max-w-[200px]">{filename || mediaCaption || 'WhatsApp Photo'}</span>
-                  <span className="text-[10px] text-slate-400">Tap to view or reload</span>
+                  <span className="text-[10px] text-slate-400">Tap to view in fullscreen</span>
                 </div>
                 <button
                   onClick={(e) => {
@@ -234,7 +232,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                     setImageLoaded(false);
                     setRetryKey((k) => k + 1);
                   }}
-                  className="px-2.5 py-1 text-[11px] font-semibold bg-[#008069] hover:bg-[#00705c] dark:bg-[#25D366] text-white rounded-lg flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
+                  className="px-3 py-1 text-[11px] font-semibold bg-[#008069] hover:bg-[#00705c] dark:bg-[#25D366] text-white rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs mt-1"
                 >
                   <RotateCcw className="w-3 h-3" />
                   <span>Reload Image</span>
@@ -249,24 +247,31 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                   timestamp,
                   senderName: fromMe ? 'You' : 'Customer'
                 })}
-                className="relative rounded-xl overflow-hidden bg-slate-200/60 dark:bg-slate-800/60 min-w-[220px] max-w-sm max-h-80 cursor-pointer group shadow-2xs"
+                className="relative rounded-xl overflow-hidden bg-slate-200/60 dark:bg-slate-800/60 min-w-[230px] max-w-[340px] sm:max-w-[380px] cursor-pointer group shadow-xs select-none"
               >
                 {!imageLoaded && (
-                  <div className="h-44 w-full bg-slate-200 dark:bg-slate-800 animate-pulse flex flex-col items-center justify-center text-slate-400 gap-2">
-                    <ImageIcon className="w-7 h-7 opacity-50" />
-                    <span className="text-[10.5px] text-slate-400 font-medium">Loading image...</span>
+                  <div className="h-56 w-full bg-slate-200/80 dark:bg-slate-800 flex flex-col items-center justify-center text-slate-400 gap-2 animate-pulse">
+                    <ImageIcon className="w-8 h-8 opacity-60" />
+                    <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Loading photo...</span>
                   </div>
                 )}
                 <img
                   key={retryKey}
                   src={retryKey > 0 ? `${resolvedUrl}${resolvedUrl.includes('?') ? '&' : '?'}retry=${retryKey}` : resolvedUrl}
-                  alt={mediaCaption || filename || 'WhatsApp Image'}
+                  alt=""
+                  ref={(img) => {
+                    if (img && img.complete && img.naturalWidth > 0 && !imageLoaded) {
+                      setImageLoaded(true);
+                    }
+                  }}
                   onLoad={() => setImageLoaded(true)}
-                  onError={() => setImageError(true)}
-                  className={`w-full h-auto max-h-80 object-cover group-hover:scale-102 transition-all duration-200 ${
-                    imageLoaded ? 'block opacity-100' : 'hidden opacity-0'
+                  onError={() => {
+                    console.warn('[MessageBubble] Image failed to load:', resolvedUrl);
+                    setImageError(true);
+                  }}
+                  className={`w-full h-auto max-h-[380px] object-cover rounded-xl block transition-all duration-300 group-hover:scale-[1.01] ${
+                    imageLoaded ? 'opacity-100' : 'opacity-0 absolute inset-0'
                   }`}
-                  loading="lazy"
                 />
                 {imageLoaded && (
                   <div className="absolute inset-0 bg-black/0 group-hover:bg-black/15 transition-colors flex items-center justify-center pointer-events-none">
@@ -275,10 +280,28 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                     </div>
                   </div>
                 )}
+
+                {/* Real WhatsApp floating timestamp pill inside photo */}
+                {!mediaCaption && (
+                  <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10.5px] px-2 py-0.5 rounded-full backdrop-blur-xs flex items-center gap-1.5 shadow-sm font-medium z-10 select-none">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onPinToQuickFiles?.(message);
+                      }}
+                      title="Add to Quick Files"
+                      className="opacity-75 hover:opacity-100 transition-opacity pointer-events-auto"
+                    >
+                      <BookmarkPlus className="w-3 h-3 text-white" />
+                    </button>
+                    <span>{formatTime(timestamp)}</span>
+                    {renderStatus(true)}
+                  </div>
+                )}
               </div>
             )}
             {mediaCaption && (
-              <p className="text-[14px] px-1 pt-1 break-words select-text">{mediaCaption}</p>
+              <p className="text-[14px] px-2 pt-1 pb-0.5 break-words select-text">{mediaCaption}</p>
             )}
           </div>
         )}
@@ -491,20 +514,31 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
           </div>
         )}
 
-        {/* Timestamp, Pin to Quick Files, and Delivery Status Tick */}
-        <div className="flex items-center justify-end gap-1.5 mt-1 text-[10.5px] text-slate-500 dark:text-slate-400 select-none">
-          {(type === 'audio' || type === 'image' || type === 'document' || type === 'video') && (
-            <button
-              onClick={() => onPinToQuickFiles?.(message)}
-              title="Add this file to Quick Send presets (max 10)"
-              className="p-0.5 text-slate-400 hover:text-[#008069] dark:hover:text-[#25D366] transition-colors"
-            >
-              <BookmarkPlus className="w-3.5 h-3.5" />
-            </button>
-          )}
-          <span>{formatTime(timestamp)}</span>
-          {renderStatus()}
-        </div>
+        {/* 8. UNRECOGNIZED / UNSUPPORTED / INTERACTIVE MESSAGE */}
+        {type !== 'text' && type !== 'image' && type !== 'sticker' && type !== 'video' && type !== 'audio' && type !== 'document' && type !== 'location' && type !== 'template' && (
+          <div className="flex items-center gap-2 py-0.5 px-1">
+            <p className="text-[14px] leading-relaxed break-words whitespace-pre-wrap select-text">
+              {text || 'WhatsApp message received'}
+            </p>
+          </div>
+        )}
+
+        {/* Timestamp, Pin to Quick Files, and Delivery Status Tick (hidden if captionless photo) */}
+        {(!isImageOnly || imageError) && (
+          <div className="flex items-center justify-end gap-1.5 mt-1 text-[10.5px] text-slate-500 dark:text-slate-400 select-none">
+            {(type === 'audio' || type === 'image' || type === 'document' || type === 'video') && (
+              <button
+                onClick={() => onPinToQuickFiles?.(message)}
+                title="Add this file to Quick Send presets (max 10)"
+                className="p-0.5 text-slate-400 hover:text-[#008069] dark:hover:text-[#25D366] transition-colors"
+              >
+                <BookmarkPlus className="w-3.5 h-3.5" />
+              </button>
+            )}
+            <span>{formatTime(timestamp)}</span>
+            {renderStatus()}
+          </div>
+        )}
       </div>
     </div>
   );

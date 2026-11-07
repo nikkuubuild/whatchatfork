@@ -2,6 +2,7 @@ import { WhatsAppCredentials, Conversation, ChatMessage, WhatsAppTemplate, Broad
 import { generateVoiceNoteWavUrl } from './audioGenerator';
 import { getSampleImageDataUrl, getSampleVideoUrl } from './sampleMedia';
 import { resolveMediaUrl } from './mediaResolver';
+import { safeTimestamp } from './dateFormatter';
 
 const STORAGE_KEYS = {
   CREDENTIALS: 'whatscloud_credentials_v1',
@@ -338,6 +339,14 @@ export const LocalStorageManager = {
         let parsed: Conversation[] = JSON.parse(raw);
         // Clean out legacy demo conversations
         parsed = parsed.filter((c) => !['conv_1', 'conv_2', 'conv_3', 'conv_4'].includes(c.id));
+        // Auto-heal timestamps
+        parsed = parsed.map((c) => {
+          if (c.updatedAt) c.updatedAt = safeTimestamp(c.updatedAt);
+          if (c.lastMessage && c.lastMessage.timestamp) {
+            c.lastMessage.timestamp = safeTimestamp(c.lastMessage.timestamp);
+          }
+          return c;
+        });
         // Ensure dk (+917372893607) exists in conversations
         const hasDk = parsed.some(
           (c) => c.id === 'conv_917372893607' || c.phoneNumber.replace(/[^0-9]/g, '').includes('917372893607')
@@ -376,8 +385,8 @@ export const LocalStorageManager = {
               if (m.mediaUrl) {
                 m.mediaUrl = resolveMediaUrl(m.mediaUrl);
               }
-              if (m.timestamp && typeof m.timestamp === 'string') {
-                m.timestamp = m.timestamp.length === 10 ? parseInt(m.timestamp, 10) * 1000 : parseInt(m.timestamp, 10);
+              if (m.timestamp) {
+                m.timestamp = safeTimestamp(m.timestamp);
               }
               return m;
             });

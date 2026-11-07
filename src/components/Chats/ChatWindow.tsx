@@ -262,13 +262,23 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         mediaUrl: uploadRes.url,
         filename: file.name,
         fileSize: file.size,
-        mediaCaption: type === 'image' || type === 'video' ? file.name : undefined,
+        mediaCaption: undefined, // Real WhatsApp does not auto-populate filename as photo caption
         timestamp: Date.now(),
         status: 'sending'
       };
       handleDispatch(msg);
     } catch (e) {
-      const localUrl = URL.createObjectURL(file);
+      let localUrl = '';
+      try {
+        localUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      } catch (_) {
+        localUrl = URL.createObjectURL(file);
+      }
       const msg: ChatMessage = {
         id: `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         conversationId: conversation.id,

@@ -2,6 +2,7 @@ import React from 'react';
 import { X, Download, ArrowLeft, FileText, Share2, ZoomIn, ZoomOut } from 'lucide-react';
 import { ChatMessage } from '../../types/whatsapp';
 import { resolveMediaUrl } from '../../utils/mediaResolver';
+import { safeTimestamp } from '../../utils/dateFormatter';
 
 interface MediaViewerModalProps {
   media: {
@@ -25,10 +26,8 @@ export const MediaViewerModal: React.FC<MediaViewerModalProps> = ({ media, onClo
 
   const formatTime = (ts?: any) => {
     if (!ts) return '';
-    let num = typeof ts === 'number' ? ts : parseInt(String(ts), 10);
-    if (isNaN(num)) return '';
-    if (num < 1e12) num *= 1000;
-    const d = new Date(num);
+    const ms = safeTimestamp(ts);
+    const d = new Date(ms);
     if (isNaN(d.getTime())) return '';
     return d.toLocaleString([], {
       month: 'short',

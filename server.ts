@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
 import { initDatabase, db } from './server/db.js';
 import { saasRouter } from './server/routes.js';
 import { processInboundWebhookPayload } from './server/multiTenantWebhook.js';
@@ -49,10 +50,18 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Ensure upload directory exists for media files
 const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+const DIST_UPLOADS_DIR = path.join(__dirname, 'dist', 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
+if (!fs.existsSync(DIST_UPLOADS_DIR)) {
+  fs.mkdirSync(DIST_UPLOADS_DIR, { recursive: true });
+}
 app.use('/uploads', express.static(UPLOADS_DIR));
+app.use('/uploads', express.static(DIST_UPLOADS_DIR));
+app.get('/uploads/*', (req, res) => {
+  res.status(404).send('Upload file not found');
+});
 
 // Mount SaaS Multi-Tenant API Router
 app.use('/api', saasRouter);
@@ -364,8 +373,12 @@ app.post('/api/whatsapp/upload-local-media', async (req, res) => {
     const ext = path.extname(filename || '') || (mimeType.includes('audio') ? '.webm' : mimeType.includes('image') ? '.jpg' : mimeType.includes('pdf') ? '.pdf' : '.bin');
     const safeName = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}${ext}`;
     const filePath = path.join(UPLOADS_DIR, safeName);
-
     fs.writeFileSync(filePath, buffer);
+
+    try {
+      if (!fs.existsSync(DIST_UPLOADS_DIR)) fs.mkdirSync(DIST_UPLOADS_DIR, { recursive: true });
+      fs.writeFileSync(path.join(DIST_UPLOADS_DIR, safeName), buffer);
+    } catch (_) {}
 
     // Build accessible URL (relative url for clean in-browser loading on any domain, plus full URL for external dispatches)
     const appUrl = getAppBaseUrl(req);
@@ -452,14 +465,21 @@ const handleMediaProxy = async (req: express.Request, res: express.Response) => 
       // 1. Retrieve the media URL from Meta Graph API
       try {
         const metaRes = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
-          headers: { Authorization: `Bearer ${token}` }
+          headers: { 
+            Authorization: `Bearer ${token}`,
+            'User-Agent': 'curl/7.64.1'
+          }
         });
         const metaData = await metaRes.json();
         if (metaRes.ok && metaData.url) {
           downloadUrl = metaData.url;
           mimeType = metaData.mime_type || null;
+        } else {
+          console.warn(`[MediaProxy Meta API Warning] Status ${metaRes.status}:`, metaData);
         }
-      } catch (_) {}
+      } catch (fetchErr) {
+        console.error('[MediaProxy Fetch Error]:', fetchErr);
+      }
     }
 
     if (!downloadUrl && directUrl) {
@@ -475,7 +495,10 @@ const handleMediaProxy = async (req: express.Request, res: express.Response) => 
 
     // 2. Fetch binary stream from Meta CDN using Bearer auth
     const fileRes = await fetch(downloadUrl, {
-      headers: { Authorization: `Bearer ${token}` }
+      headers: { 
+        Authorization: `Bearer ${token}`,
+        'User-Agent': 'curl/7.64.1'
+      }
     });
     if (!fileRes.ok) {
       return res.status(fileRes.status).send('Failed to fetch media file stream from Meta');
@@ -496,6 +519,9 @@ const handleMediaProxy = async (req: express.Request, res: express.Response) => 
         fileSize: buffer.length,
         cachedAt: Date.now()
       }));
+      if (fs.existsSync(DIST_UPLOADS_DIR)) {
+        fs.writeFileSync(path.join(DIST_UPLOADS_DIR, `media_${safeMediaId}.bin`), buffer);
+      }
     } catch (_) {}
 
     res.setHeader('Content-Type', contentType);
@@ -767,7 +793,7 @@ app.post('/api/whatsapp/auto-setup', async (req, res) => {
   }
 });
 
-// Save credentials server-side and trigger background auto-registration
+// Save credentials server-side, upsert into PostgreSQL channels, and trigger background auto-registration
 app.post('/api/whatsapp/save-credentials', async (req, res) => {
   try {
     const creds = req.body;
@@ -775,11 +801,67 @@ app.post('/api/whatsapp/save-credentials', async (req, res) => {
     if (creds.accessToken) lastKnownToken = creds.accessToken;
     if (creds.appSecret) configuredAppSecret = creds.appSecret;
 
+    // Permanently persist active channel into PostgreSQL so token survives Render container restarts
+    if (creds.accessToken) {
+      try {
+        const defaultTenant = (await db.prepare("SELECT id FROM tenants WHERE slug = 'default-workspace' LIMIT 1").get()) as { id: string } | undefined
+          || (await db.prepare("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1").get()) as { id: string } | undefined;
+        const tenantId = defaultTenant?.id || 'tenant_default_01';
+
+        const existingChan = (await db.prepare(`
+          SELECT id FROM whatsapp_channels
+          WHERE phone_number_id = ? OR tenant_id = ?
+          LIMIT 1
+        `).get(creds.phoneNumberId || 'placeholder', tenantId)) as { id: string } | undefined;
+
+        const now = Date.now();
+        if (existingChan) {
+          await db.prepare(`
+            UPDATE whatsapp_channels
+            SET access_token = ?, phone_number_id = COALESCE(?, phone_number_id), waba_id = COALESCE(?, waba_id),
+                app_id = COALESCE(?, app_id), app_secret = COALESCE(?, app_secret),
+                display_phone_number = COALESCE(?, display_phone_number), verified_name = COALESCE(?, verified_name),
+                status = 'active', updated_at = ?
+            WHERE id = ?
+          `).run(
+            creds.accessToken.trim(),
+            creds.phoneNumberId?.trim() || null,
+            creds.wabaId?.trim() || null,
+            creds.appId?.trim() || null,
+            creds.appSecret?.trim() || null,
+            creds.displayPhoneNumber?.trim() || null,
+            creds.verifiedName?.trim() || null,
+            now,
+            existingChan.id
+          );
+        } else {
+          await db.prepare(`
+            INSERT INTO whatsapp_channels (id, tenant_id, connection_mode, waba_id, phone_number_id, display_phone_number, verified_name, access_token, app_id, app_secret, status, connected_at, updated_at)
+            VALUES (?, ?, 'byo_meta', ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+          `).run(
+            uuidv4(),
+            tenantId,
+            creds.wabaId?.trim() || null,
+            creds.phoneNumberId?.trim() || null,
+            creds.displayPhoneNumber?.trim() || null,
+            creds.verifiedName?.trim() || null,
+            creds.accessToken.trim(),
+            creds.appId?.trim() || null,
+            creds.appSecret?.trim() || null,
+            now,
+            now
+          );
+        }
+      } catch (dbErr) {
+        console.error('[save-credentials DB sync error]:', dbErr);
+      }
+    }
+
     if (creds.appId && creds.appSecret && creds.wabaId && creds.accessToken) {
       autoRegisterWebhookWithMeta(creds, getWhatsAppWebhookUrl()).catch(() => {});
     }
 
-    return res.json({ success: true, message: 'Credentials saved on server' });
+    return res.json({ success: true, message: 'Credentials saved and synchronized in PostgreSQL database.' });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err?.message || 'Failed to save credentials' });
   }
@@ -827,6 +909,15 @@ app.post('/api/whatsapp/update-token', async (req, res) => {
 
     await saveSavedCredentials(updatedCreds);
     lastKnownToken = cleanToken;
+
+    // Persist new token into PostgreSQL whatsapp_channels table
+    try {
+      await db.prepare(`
+        UPDATE whatsapp_channels
+        SET access_token = ?, updated_at = ?
+        WHERE access_token IS NOT NULL
+      `).run(cleanToken, Date.now());
+    } catch (_) {}
 
     return res.json({
       success: true,
@@ -1057,6 +1148,18 @@ app.get('/api/whatsapp/webhook-stats', (_req, res) => {
 async function startServer() {
   // Initialize PostgreSQL Database schema & relations
   await initDatabase();
+
+  // Restore active WhatsApp channel credentials from PostgreSQL database
+  try {
+    const chan = (await db.prepare("SELECT access_token, app_secret FROM whatsapp_channels WHERE access_token IS NOT NULL AND access_token != '' ORDER BY connected_at DESC LIMIT 1").get()) as any;
+    if (chan?.access_token) {
+      lastKnownToken = chan.access_token;
+      console.log('[Server Startup] Restored active WhatsApp Meta access token from PostgreSQL database');
+    }
+    if (chan?.app_secret) {
+      configuredAppSecret = chan.app_secret;
+    }
+  } catch (_) {}
 
   // Initialize Webhook Telemetry metrics from database
   await initializeWebhookMetrics();

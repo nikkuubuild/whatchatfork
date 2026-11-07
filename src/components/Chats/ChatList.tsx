@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Search, Plus, Pin, Mic, Image, FileText, CheckCheck, UserPlus, X, Video, MapPin, Smile, Cloud, RefreshCw } from 'lucide-react';
+import { Search, Plus, Pin, Mic, Image, FileText, CheckCheck, UserPlus, X, Video, MapPin, Smile, Cloud, RefreshCw, Sparkles } from 'lucide-react';
 import { Conversation, ChatMessage } from '../../types/whatsapp';
+import { formatChatListTime } from '../../utils/dateFormatter';
 
 interface ChatListProps {
   conversations: Conversation[];
@@ -39,25 +40,7 @@ export const ChatList: React.FC<ChatListProps> = ({
     setShowNewChatModal(false);
   };
 
-  const formatTimestamp = (ts: any) => {
-    if (!ts) return '';
-    let num = typeof ts === 'number' ? ts : parseInt(String(ts), 10);
-    if (isNaN(num)) return '';
-    if (num < 1e12) num *= 1000;
-    const date = new Date(num);
-    if (isNaN(date.getTime())) return '';
-    const now = new Date();
-    const isToday = date.toDateString() === now.toDateString();
-
-    if (isToday) {
-      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    }
-    const isYesterday = new Date(now.setDate(now.getDate() - 1)).toDateString() === date.toDateString();
-    if (isYesterday) {
-      return 'Yesterday';
-    }
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  };
+  const formatTimestamp = (ts: any) => formatChatListTime(ts);
 
   const renderLastMessagePreview = (lastMsg?: ChatMessage) => {
     if (!lastMsg) return 'No messages yet';
@@ -100,6 +83,10 @@ export const ChatList: React.FC<ChatListProps> = ({
             ? lastMsg.filename || 'Document'
             : lastMsg.type === 'location'
             ? 'Location shared'
+            : lastMsg.type === 'sticker'
+            ? 'Sticker'
+            : lastMsg.text?.includes('[unsupported')
+            ? 'Sticker / Media'
             : lastMsg.text || 'Message'}
         </span>
       </div>

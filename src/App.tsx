@@ -27,6 +27,7 @@ import {
 import { WhatsAppApiService } from './services/whatsappApi';
 import { waAudio } from './utils/audio';
 import { resolveMediaUrl } from './utils/mediaResolver';
+import { safeTimestamp } from './utils/dateFormatter';
 import { MessageSquare } from 'lucide-react';
 
 export default function App() {
@@ -524,16 +525,7 @@ export default function App() {
       const msgId = msgData.id || `inc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
       // Safe timestamp parsing (avoids NaN or "Invalid Date")
-      let safeTimestamp = Date.now();
-      const rawTs = ev.timestamp || msgData.timestamp;
-      if (typeof rawTs === 'number') {
-        safeTimestamp = rawTs < 1e12 ? rawTs * 1000 : rawTs;
-      } else if (typeof rawTs === 'string' && rawTs.trim()) {
-        const parsed = parseInt(rawTs, 10);
-        if (!isNaN(parsed)) {
-          safeTimestamp = rawTs.length === 10 ? parsed * 1000 : parsed;
-        }
-      }
+      const safeParsedTime = safeTimestamp(ev.timestamp || msgData.timestamp);
 
       setConversations((prevConvs) => {
         const existing = prevConvs.find(
@@ -550,9 +542,10 @@ export default function App() {
           type: (msgData.type === 'sticker' ? 'sticker' : type) as ChatMessage['type'],
           text: msgData.caption || text,
           mediaUrl: msgData.mediaUrl ? resolveMediaUrl(msgData.mediaUrl) : mediaUrl,
+          mediaCaption: msgData.mediaCaption || msgData.caption || (type === 'image' && msgData.image?.caption ? msgData.image.caption : undefined),
           filename: fileName || msgData.filename,
           location: locationData || msgData.location,
-          timestamp: safeTimestamp,
+          timestamp: safeParsedTime,
           status: msgData.status || (isFromMe ? 'sent' : 'read')
         };
 
